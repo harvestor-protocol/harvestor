@@ -1,15 +1,14 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, Symbol, Vec,
-    Map, Option as SorobanOption, invoke, IntoVal, FromVal, Val, TryInto,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, Vec,
 };
 
 /// Loan status enumeration: Pending → Active → Repaid or Defaulted
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 #[contracttype]
 pub enum LoanStatus {
-    /// Awaiting approval from the lender
+    /// Awaiting approval from the admin
     Pending = 0,
     /// Approved and funds disbursed
     Active = 1,
@@ -27,7 +26,7 @@ pub struct Loan {
     pub id: u64,
     /// Farmer's Stellar address
     pub farmer: Address,
-    /// Loan amount in microunits (e.g., 1M = 1 USDC)
+    /// Loan amount in microunits (e.g., 1_000_000 = 1 USDC with 6 decimals)
     pub amount: i128,
     /// Loan term in days
     pub term_days: u32,
@@ -41,196 +40,104 @@ pub struct Loan {
     pub due_at: u64,
 }
 
-/// Lender pool contribution record
+/// Storage key enum — each variant is a unique, typed key.
+/// Using an enum with contracttype avoids symbol collisions entirely.
 #[derive(Clone)]
 #[contracttype]
-pub struct PoolContribution {
-    /// Lender's Stellar address
-    pub lender: Address,
-    /// Amount contributed to the pool (in microunits)
-    pub balance: i128,
+pub enum DataKey {
+    /// The contract admin address
+    Admin,
+    /// Address of the score-attestation contract
+    ScoreContract,
+    /// Next loan ID counter
+    NextLoanId,
+    /// Total pool balance
+    PoolBalance,
+    /// Loan record by ID
+    Loan(u64),
+    /// List of loan IDs belonging to a farmer
+    FarmerLoans(Address),
+    /// Contributed balance for a specific lender
+    LenderBalance(Address),
 }
 
-/// Trait defining all contract functions
-#[contract]
-pub trait MicroLoanContract {
-    /// Set the address of the score-attestation contract for cross-contract calls.
-    ///
-    /// This function is admin-only and must be called once during initialization.
-    /// The score contract address is stored and used by `request_loan` to validate
-    /// farmer credit scores.
-    ///
-    /// # Arguments
-    /// * `admin` - The admin address (must sign the transaction)
-    /// * `score_contract` - The contract address of the score-attestation contract
-    ///
-    /// # Errors
-    /// Returns error if admin fails signature verification
-    fn set_score_contract(env: Env, admin: Address, score_contract: Address);
-
-    /// Deposit USDC (or test token) into the lending pool.
-    ///
-    /// Lenders call this function to contribute capital. Each lender's contributions
-    /// are tracked and credited from the pool when loans are approved.
-    ///
-    /// # Arguments
-    /// * `lender` - The lender's address (must sign the transaction)
-    /// * `amount` - Amount to deposit (must be > 0)
-    ///
-    /// # Errors
-    /// Returns error if lender fails signature verification or amount <= 0
-    fn fund_pool(env: Env, lender: Address, amount: i128);
-
-    /// Request a loan with the specified term.
-    ///
-    /// The farmer's credit score is fetched via cross-contract call to the
-    /// score-attestation contract. If the score is below the minimum threshold
-    /// (default 30), the request is rejected. Otherwise, a Pending loan record
-    /// is created.
-    ///
-    /// # Arguments
-    /// * `farmer` - The farmer's address (must sign the transaction)
-    /// * `amount` - Loan amount requested (must be > 0)
-    /// * `term_days` - Loan term in days (must be 1-3650, i.e., ~10 years max)
-    ///
-    /// # Errors
-    /// * Returns error if farmer fails signature verification
-    /// * Returns error if amount <= 0 or term_days out of range
-    /// * Returns error if farmer's score is below minimum threshold
-    /// * Returns error if score-attestation contract call fails
-    fn request_loan(env: Env, farmer: Address, amount: i128, term_days: u32);
-
-    /// Approve a pending loan and disburse funds to the farmer.
-    ///
-    /// This moves the loan from Pending to Active status and transfers the loan
-    /// amount from the pool to the farmer. The approver must be authorized
-    /// (admin-only in v1).
-    ///
-    /// # Arguments
-    /// * `approver` - The approver's address (must sign the transaction, must be admin)
-    /// * `loan_id` - The loan ID to approve
-    ///
-    /// # Errors
-    /// * Returns error if approver fails signature verification or is not admin
-    /// * Returns error if loan_id does not exist or is not Pending
-    /// * Returns error if pool has insufficient balance
-    fn approve_loan(env: Env, approver: Address, loan_id: u64);
-
-    /// Make a repayment on an active loan.
-    ///
-    /// Farmer can repay the loan in full or in part. Once fully repaid, the
-    /// loan status is set to Repaid. Overpayments are rejected.
-    ///
-    /// # Arguments
-    /// * `farmer` - The farmer's address (must sign the transaction)
-    /// * `loan_id` - The loan ID to repay
-    /// * `amount` - Repayment amount (must be > 0 and <= remaining balance)
-    ///
-    /// # Errors
-    /// * Returns error if farmer fails signature verification
-    /// * Returns error if amount <= 0 or exceeds remaining balance
-    /// * Returns error if loan_id does not exist or is not Active
-    fn repay_loan(env: Env, farmer: Address, loan_id: u64, amount: i128);
-
-    /// Mark a loan as defaulted after term expiry.
-    ///
-    /// Admin-only function. Can only be called for Active loans that have
-    /// passed their due date and are not fully repaid.
-    ///
-    /// # Arguments
-    /// * `admin` - The admin address (must sign the transaction)
-    /// * `loan_id` - The loan ID to mark as defaulted
-    ///
-    /// # Errors
-    /// * Returns error if admin fails signature verification
-    /// * Returns error if loan_id does not exist or is not Active
-    /// * Returns error if current time < due_at (loan not yet due)
-    fn mark_defaulted(env: Env, admin: Address, loan_id: u64);
-
-    /// Retrieve a specific loan by ID.
-    ///
-    /// # Arguments
-    /// * `loan_id` - The loan ID to retrieve
-    ///
-    /// # Returns
-    /// Option containing the Loan record, or None if not found
-    fn get_loan(env: Env, loan_id: u64) -> SorobanOption<Loan>;
-
-    /// Retrieve all loans for a specific farmer.
-    ///
-    /// Returns loans in the order they were created, including all statuses
-    /// (Pending, Active, Repaid, Defaulted).
-    ///
-    /// # Arguments
-    /// * `farmer` - The farmer's address
-    ///
-    /// # Returns
-    /// Vector of all Loan records for this farmer (empty if none exist)
-    fn get_farmer_loans(env: Env, farmer: Address) -> Vec<Loan>;
-
-    /// Get the current balance of the lending pool.
-    ///
-    /// # Returns
-    /// The total amount of capital available in the pool
-    fn get_pool_balance(env: Env) -> i128;
-
-    /// Get a lender's contributed balance.
-    ///
-    /// # Arguments
-    /// * `lender` - The lender's address
-    ///
-    /// # Returns
-    /// The lender's contributed balance (0 if they haven't contributed)
-    fn get_lender_balance(env: Env, lender: Address) -> i128;
+/// Mirror of ScoreRecord from the score-attestation contract.
+///
+/// This type must match the field layout of `ScoreRecord` in the
+/// score-attestation contract exactly so that XDR deserialization works
+/// when we decode the return value of the cross-contract `get_score` call.
+#[derive(Clone)]
+#[contracttype]
+pub struct ScoreRecord {
+    pub farmer: Address,
+    pub score: u32,
+    pub evidence_hash: BytesN<32>,
+    pub submitter: Address,
+    pub timestamp: u64,
 }
-
-/// Contract state struct
-pub struct MicroLoanContractImpl;
 
 /// Minimum credit score required to request a loan
 const MIN_CREDIT_SCORE: u32 = 30;
 
-/// Storage keys
-fn score_contract_key() -> Symbol {
-    symbol_short!("scorecon")
-}
-
-fn next_loan_id_key() -> Symbol {
-    symbol_short!("nextid")
-}
-
-fn loan_key(loan_id: u64) -> Symbol {
-    // Use a symbol that includes the loan_id (limited to ~8 bytes due to Symbol size)
-    // For real production, use a Map with u64 keys
-    symbol_short!("loan")
-}
-
-fn loans_by_farmer_key(farmer: &Address) -> Symbol {
-    symbol_short!("farloans")
-}
-
-fn pool_balance_key() -> Symbol {
-    symbol_short!("poolbal")
-}
-
-fn lender_balance_key(lender: &Address) -> Symbol {
-    symbol_short!("lendbal")
-}
-
-fn admin_key() -> Symbol {
-    symbol_short!("admin")
-}
+/// The microloan contract struct
+#[contract]
+pub struct MicroLoanContract;
 
 #[contractimpl]
-impl MicroLoanContract for MicroLoanContractImpl {
-    fn set_score_contract(env: Env, admin: Address, score_contract: Address) {
+impl MicroLoanContract {
+    /// Initialize the contract with an admin address.
+    ///
+    /// Must be called once after deployment. Sets the admin who can approve
+    /// loans and mark defaults.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address (must sign the transaction)
+    pub fn initialize(env: Env, admin: Address) {
         admin.require_auth();
-        
-        env.storage().instance().set(&admin_key(), &admin);
-        env.storage().instance().set(&score_contract_key(), &score_contract);
+
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("Contract already initialized");
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::NextLoanId, &1u64);
+        env.storage().instance().set(&DataKey::PoolBalance, &0i128);
     }
 
-    fn fund_pool(env: Env, lender: Address, amount: i128) {
+    /// Set the address of the score-attestation contract for cross-contract calls.
+    ///
+    /// This function is admin-only and must be called once during initialization.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address (must sign the transaction)
+    /// * `score_contract` - The contract address of the score-attestation contract
+    pub fn set_score_contract(env: Env, admin: Address, score_contract: Address) {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Contract not initialized"));
+
+        if admin != stored_admin {
+            panic!("Caller is not the admin");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ScoreContract, &score_contract);
+    }
+
+    /// Deposit capital into the lending pool.
+    ///
+    /// Lenders call this function to contribute capital. Each lender's balance
+    /// is tracked separately.
+    ///
+    /// # Arguments
+    /// * `lender` - The lender's address (must sign the transaction)
+    /// * `amount` - Amount to deposit (must be > 0)
+    pub fn fund_pool(env: Env, lender: Address, amount: i128) {
         lender.require_auth();
 
         if amount <= 0 {
@@ -238,27 +145,37 @@ impl MicroLoanContract for MicroLoanContractImpl {
         }
 
         // Update lender balance
-        let mut lender_bal = env
+        let lender_bal: i128 = env
             .storage()
             .instance()
-            .get::<_, i128>(&lender_balance_key(&lender))
+            .get(&DataKey::LenderBalance(lender.clone()))
             .unwrap_or(0);
-        lender_bal += amount;
         env.storage()
             .instance()
-            .set(&lender_balance_key(&lender), &lender_bal);
+            .set(&DataKey::LenderBalance(lender.clone()), &(lender_bal + amount));
 
         // Update pool balance
-        let mut pool_bal = env
+        let pool_bal: i128 = env
             .storage()
             .instance()
-            .get::<_, i128>(&pool_balance_key())
+            .get(&DataKey::PoolBalance)
             .unwrap_or(0);
-        pool_bal += amount;
-        env.storage().instance().set(&pool_balance_key(), &pool_bal);
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolBalance, &(pool_bal + amount));
     }
 
-    fn request_loan(env: Env, farmer: Address, amount: i128, term_days: u32) {
+    /// Request a loan with the specified term.
+    ///
+    /// The farmer's credit score is fetched via cross-contract call to the
+    /// score-attestation contract. If the score is below the minimum threshold
+    /// (default 30), the request is rejected.
+    ///
+    /// # Arguments
+    /// * `farmer` - The farmer's address (must sign the transaction)
+    /// * `amount` - Loan amount requested (must be > 0)
+    /// * `term_days` - Loan term in days (must be 1–3650)
+    pub fn request_loan(env: Env, farmer: Address, amount: i128, term_days: u32) {
         farmer.require_auth();
 
         if amount <= 0 {
@@ -273,47 +190,44 @@ impl MicroLoanContract for MicroLoanContractImpl {
         let score_contract: Address = env
             .storage()
             .instance()
-            .get(&score_contract_key())
+            .get(&DataKey::ScoreContract)
             .unwrap_or_else(|| panic!("Score contract not configured"));
 
-        // Cross-contract call to get farmer's score
-        // We use Symbol and InvokeContractArgs to call get_score on the score contract
-        let score_result: SorobanOption<(Address, u32, BytesN<32>, Address, u64)> = env
-            .invoke_contract(
-                &score_contract,
-                &symbol_short!("get_scr"),
-                vec![&env, farmer.clone().into_val(&env)],
-            );
+        // Cross-contract call: get_score(farmer) -> Option<ScoreRecord>
+        // ScoreRecord is { farmer, score, evidence_hash, submitter, timestamp }
+        // We only need the score field, so we retrieve the whole record and extract it.
+        //
+        // env.invoke_contract returns the XDR-decoded return value.
+        // get_score returns Option<ScoreRecord>; we type it as Option<ScoreRecord> here.
+        // Because ScoreRecord is a contracttype struct, we can decode it inline.
+        // To avoid importing the foreign crate's struct, we extract only the score (u32)
+        // by calling get_score and then accessing the .score field via a local mirror type.
+        //
+        // Simplest correct approach: call get_score once and match on the result.
+        let score_opt: Option<ScoreRecord> = env.invoke_contract(
+            &score_contract,
+            &symbol_short!("get_score"),
+            vec![&env, farmer.clone()],
+        );
 
-        // Check if score exists and meets minimum threshold
-        if let SorobanOption::Some(_score_data) = score_result {
-            // Extract score from the returned tuple
-            // The tuple is (farmer, score, evidence_hash, submitter, timestamp)
-            // For now, we'll assume score is at index 1
-            let score: u32 = env
-                .invoke_contract(
-                    &score_contract,
-                    &symbol_short!("get_scr"),
-                    vec![&env, farmer.clone().into_val(&env)],
-                )
-                .unwrap_or_else(|| panic!("Failed to get score"));
+        let score = match score_opt {
+            Some(record) => record.score,
+            None => panic!("Farmer has no credit score on record"),
+        };
 
-            if score < MIN_CREDIT_SCORE {
-                panic!("Farmer credit score below minimum threshold");
-            }
-        } else {
-            panic!("Farmer has no credit score on record");
+        if score < MIN_CREDIT_SCORE {
+            panic!("Farmer credit score below minimum threshold");
         }
 
-        // Create new loan
+        // Allocate next loan ID
         let loan_id: u64 = env
             .storage()
             .instance()
-            .get(&next_loan_id_key())
+            .get(&DataKey::NextLoanId)
             .unwrap_or(1);
 
         let now = env.ledger().timestamp();
-        let due_at = now + (term_days as u64) * 86400;
+        let due_at = now + (term_days as u64) * 86_400;
 
         let loan = Loan {
             id: loan_id,
@@ -326,87 +240,99 @@ impl MicroLoanContract for MicroLoanContractImpl {
             due_at,
         };
 
-        // Store loan
+        // Store loan record, keyed uniquely by loan ID
         env.storage()
             .instance()
-            .set(&format!("loan_{}", loan_id).as_str().try_into().unwrap_or(loan_key(loan_id)), &loan);
+            .set(&DataKey::Loan(loan_id), &loan);
 
-        // Add loan ID to farmer's loan list
+        // Append loan ID to farmer's loan list
         let mut farmer_loans: Vec<u64> = env
             .storage()
             .instance()
-            .get(&loans_by_farmer_key(&farmer))
+            .get(&DataKey::FarmerLoans(farmer.clone()))
             .unwrap_or_else(|| vec![&env]);
         farmer_loans.push_back(loan_id);
         env.storage()
             .instance()
-            .set(&loans_by_farmer_key(&farmer), &farmer_loans);
+            .set(&DataKey::FarmerLoans(farmer.clone()), &farmer_loans);
 
-        // Increment next loan ID
+        // Increment the loan ID counter
         env.storage()
             .instance()
-            .set(&next_loan_id_key(), &(loan_id + 1));
+            .set(&DataKey::NextLoanId, &(loan_id + 1));
     }
 
-    fn approve_loan(env: Env, approver: Address, loan_id: u64) {
+    /// Approve a pending loan and disburse funds to the farmer.
+    ///
+    /// Moves the loan from Pending to Active. The pool balance is debited by
+    /// the loan amount. Only the stored admin can call this function.
+    ///
+    /// # Arguments
+    /// * `approver` - The approver's address (must sign the transaction, must be admin)
+    /// * `loan_id` - The loan ID to approve
+    pub fn approve_loan(env: Env, approver: Address, loan_id: u64) {
         approver.require_auth();
 
-        // Get the stored admin address
         let admin: Address = env
             .storage()
             .instance()
-            .get(&admin_key())
-            .unwrap_or_else(|| panic!("Admin not configured"));
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Contract not initialized"));
 
         if approver != admin {
             panic!("Only admin can approve loans");
         }
 
-        // Get the loan
         let mut loan: Loan = env
             .storage()
             .instance()
-            .get(&format!("loan_{}", loan_id).as_str().try_into().unwrap_or(loan_key(loan_id)))
+            .get(&DataKey::Loan(loan_id))
             .unwrap_or_else(|| panic!("Loan not found"));
 
         if loan.status != LoanStatus::Pending {
             panic!("Loan is not in Pending status");
         }
 
-        // Check pool balance
         let pool_bal: i128 = env
             .storage()
             .instance()
-            .get(&pool_balance_key())
+            .get(&DataKey::PoolBalance)
             .unwrap_or(0);
+
         if pool_bal < loan.amount {
             panic!("Insufficient funds in pool");
         }
 
-        // Update loan status
         loan.status = LoanStatus::Active;
         env.storage()
             .instance()
-            .set(&format!("loan_{}", loan_id).as_str().try_into().unwrap_or(loan_key(loan_id)), &loan);
+            .set(&DataKey::Loan(loan_id), &loan);
 
-        // Deduct from pool balance
         env.storage()
             .instance()
-            .set(&pool_balance_key(), &(pool_bal - loan.amount));
+            .set(&DataKey::PoolBalance, &(pool_bal - loan.amount));
     }
 
-    fn repay_loan(env: Env, farmer: Address, loan_id: u64, amount: i128) {
+    /// Make a repayment on an active loan.
+    ///
+    /// Farmer can repay in full or in part. Once fully repaid, the loan status
+    /// transitions to Repaid. Overpayments are rejected.
+    ///
+    /// # Arguments
+    /// * `farmer` - The farmer's address (must sign the transaction)
+    /// * `loan_id` - The loan ID to repay
+    /// * `amount` - Repayment amount (must be > 0 and <= remaining balance)
+    pub fn repay_loan(env: Env, farmer: Address, loan_id: u64, amount: i128) {
         farmer.require_auth();
 
         if amount <= 0 {
             panic!("Repayment amount must be positive");
         }
 
-        // Get the loan
         let mut loan: Loan = env
             .storage()
             .instance()
-            .get(&format!("loan_{}", loan_id).as_str().try_into().unwrap_or(loan_key(loan_id)))
+            .get(&DataKey::Loan(loan_id))
             .unwrap_or_else(|| panic!("Loan not found"));
 
         if loan.status != LoanStatus::Active {
@@ -417,12 +343,11 @@ impl MicroLoanContract for MicroLoanContractImpl {
             panic!("Only the loan farmer can repay this loan");
         }
 
-        let remaining_balance = loan.amount - loan.amount_repaid;
-        if amount > remaining_balance {
+        let remaining = loan.amount - loan.amount_repaid;
+        if amount > remaining {
             panic!("Repayment amount exceeds remaining balance");
         }
 
-        // Update loan
         loan.amount_repaid += amount;
         if loan.amount_repaid >= loan.amount {
             loan.status = LoanStatus::Repaid;
@@ -430,27 +355,44 @@ impl MicroLoanContract for MicroLoanContractImpl {
 
         env.storage()
             .instance()
-            .set(&format!("loan_{}", loan_id).as_str().try_into().unwrap_or(loan_key(loan_id)), &loan);
+            .set(&DataKey::Loan(loan_id), &loan);
 
-        // Add amount back to pool
+        // Return repayment to pool
         let pool_bal: i128 = env
             .storage()
             .instance()
-            .get(&pool_balance_key())
+            .get(&DataKey::PoolBalance)
             .unwrap_or(0);
         env.storage()
             .instance()
-            .set(&pool_balance_key(), &(pool_bal + amount));
+            .set(&DataKey::PoolBalance, &(pool_bal + amount));
     }
 
-    fn mark_defaulted(env: Env, admin: Address, loan_id: u64) {
+    /// Mark a loan as defaulted after term expiry.
+    ///
+    /// Admin-only. Can only be called for Active loans that have passed their
+    /// due date and are not fully repaid.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address (must sign the transaction)
+    /// * `loan_id` - The loan ID to mark as defaulted
+    pub fn mark_defaulted(env: Env, admin: Address, loan_id: u64) {
         admin.require_auth();
 
-        // Get the loan
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Contract not initialized"));
+
+        if admin != stored_admin {
+            panic!("Only admin can mark loans as defaulted");
+        }
+
         let mut loan: Loan = env
             .storage()
             .instance()
-            .get(&format!("loan_{}", loan_id).as_str().try_into().unwrap_or(loan_key(loan_id)))
+            .get(&DataKey::Loan(loan_id))
             .unwrap_or_else(|| panic!("Loan not found"));
 
         if loan.status != LoanStatus::Active {
@@ -462,46 +404,72 @@ impl MicroLoanContract for MicroLoanContractImpl {
             panic!("Loan term has not yet expired");
         }
 
-        // Mark as defaulted
         loan.status = LoanStatus::Defaulted;
         env.storage()
             .instance()
-            .set(&format!("loan_{}", loan_id).as_str().try_into().unwrap_or(loan_key(loan_id)), &loan);
+            .set(&DataKey::Loan(loan_id), &loan);
     }
 
-    fn get_loan(env: Env, loan_id: u64) -> SorobanOption<Loan> {
-        env.storage()
-            .instance()
-            .get(&format!("loan_{}", loan_id).as_str().try_into().unwrap_or(loan_key(loan_id)))
+    /// Retrieve a specific loan by ID.
+    ///
+    /// # Arguments
+    /// * `loan_id` - The loan ID to retrieve
+    ///
+    /// # Returns
+    /// Option containing the Loan record, or None if not found
+    pub fn get_loan(env: Env, loan_id: u64) -> Option<Loan> {
+        env.storage().instance().get(&DataKey::Loan(loan_id))
     }
 
-    fn get_farmer_loans(env: Env, farmer: Address) -> Vec<Loan> {
+    /// Retrieve all loans for a specific farmer.
+    ///
+    /// # Arguments
+    /// * `farmer` - The farmer's address
+    ///
+    /// # Returns
+    /// Vector of all Loan records for this farmer (empty if none exist)
+    pub fn get_farmer_loans(env: Env, farmer: Address) -> Vec<Loan> {
         let loan_ids: Vec<u64> = env
             .storage()
             .instance()
-            .get(&loans_by_farmer_key(&farmer))
+            .get(&DataKey::FarmerLoans(farmer.clone()))
             .unwrap_or_else(|| vec![&env]);
 
-        let mut result = vec![&env];
-        for loan_id in loan_ids {
-            if let SorobanOption::Some(loan) = env.storage().instance().get(&format!("loan_{}", loan_id).as_str().try_into().unwrap_or(loan_key(loan_id))) {
+        let mut result: Vec<Loan> = vec![&env];
+        for loan_id in loan_ids.iter() {
+            if let Some(loan) = env
+                .storage()
+                .instance()
+                .get(&DataKey::Loan(loan_id))
+            {
                 result.push_back(loan);
             }
         }
         result
     }
 
-    fn get_pool_balance(env: Env) -> i128 {
+    /// Get the current balance of the lending pool.
+    ///
+    /// # Returns
+    /// The total amount of capital available in the pool
+    pub fn get_pool_balance(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&pool_balance_key())
+            .get(&DataKey::PoolBalance)
             .unwrap_or(0)
     }
 
-    fn get_lender_balance(env: Env, lender: Address) -> i128 {
+    /// Get a lender's contributed balance.
+    ///
+    /// # Arguments
+    /// * `lender` - The lender's address
+    ///
+    /// # Returns
+    /// The lender's contributed balance (0 if they haven't contributed)
+    pub fn get_lender_balance(env: Env, lender: Address) -> i128 {
         env.storage()
             .instance()
-            .get(&lender_balance_key(&lender))
+            .get(&DataKey::LenderBalance(lender))
             .unwrap_or(0)
     }
 }
@@ -514,87 +482,153 @@ mod tests {
         Env,
     };
 
+    fn setup_contract(env: &Env) -> (Address, Address) {
+        let admin = Address::generate(env);
+        let contract_id = env.register_contract(None, MicroLoanContract);
+        let client = MicroLoanContractClient::new(env, &contract_id);
+        env.mock_all_auths();
+        client.initialize(&admin);
+        (contract_id, admin)
+    }
+
     #[test]
-    fn test_set_score_contract() {
+    fn test_initialize() {
         let env = Env::default();
-        let admin = Address::random(&env);
-        let score_contract = Address::random(&env);
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, MicroLoanContract);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+        env.mock_all_auths();
+        client.initialize(&admin);
+        assert_eq!(client.get_pool_balance(), 0);
+    }
 
-        MicroLoanContractImpl::set_score_contract(env.clone(), admin.clone(), score_contract.clone());
-
-        // Verify it was set (by calling set_score_contract again with same admin - should not panic)
-        MicroLoanContractImpl::set_score_contract(env, admin, score_contract);
+    #[test]
+    #[should_panic(expected = "Contract already initialized")]
+    fn test_initialize_twice_panics() {
+        let env = Env::default();
+        let (contract_id, admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+        env.mock_all_auths();
+        client.initialize(&admin);
     }
 
     #[test]
     fn test_fund_pool() {
         let env = Env::default();
-        let lender = Address::random(&env);
+        let (contract_id, _admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+        let lender = Address::generate(&env);
 
-        MicroLoanContractImpl::fund_pool(env.clone(), lender.clone(), 1_000_000);
-        let balance = MicroLoanContractImpl::get_pool_balance(env.clone());
-        assert_eq!(balance, 1_000_000);
+        env.mock_all_auths();
+        client.fund_pool(&lender, &1_000_000);
 
-        let lender_balance = MicroLoanContractImpl::get_lender_balance(env, lender);
-        assert_eq!(lender_balance, 1_000_000);
+        assert_eq!(client.get_pool_balance(), 1_000_000);
+        assert_eq!(client.get_lender_balance(&lender), 1_000_000);
     }
 
     #[test]
     #[should_panic(expected = "Fund amount must be positive")]
     fn test_fund_pool_zero_amount() {
         let env = Env::default();
-        let lender = Address::random(&env);
+        let (contract_id, _admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+        let lender = Address::generate(&env);
 
-        MicroLoanContractImpl::fund_pool(env, lender, 0);
+        env.mock_all_auths();
+        client.fund_pool(&lender, &0);
     }
 
     #[test]
     fn test_fund_pool_multiple_lenders() {
         let env = Env::default();
-        let lender1 = Address::random(&env);
-        let lender2 = Address::random(&env);
+        let (contract_id, _admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+        let lender1 = Address::generate(&env);
+        let lender2 = Address::generate(&env);
 
-        MicroLoanContractImpl::fund_pool(env.clone(), lender1.clone(), 500_000);
-        MicroLoanContractImpl::fund_pool(env.clone(), lender2.clone(), 300_000);
+        env.mock_all_auths();
+        client.fund_pool(&lender1, &500_000);
+        client.fund_pool(&lender2, &300_000);
 
-        let pool_balance = MicroLoanContractImpl::get_pool_balance(env.clone());
-        assert_eq!(pool_balance, 800_000);
+        assert_eq!(client.get_pool_balance(), 800_000);
+        assert_eq!(client.get_lender_balance(&lender1), 500_000);
+        assert_eq!(client.get_lender_balance(&lender2), 300_000);
+    }
 
-        let l1_balance = MicroLoanContractImpl::get_lender_balance(env.clone(), lender1);
-        assert_eq!(l1_balance, 500_000);
-
-        let l2_balance = MicroLoanContractImpl::get_lender_balance(env, lender2);
-        assert_eq!(l2_balance, 300_000);
+    #[test]
+    fn test_get_pool_balance_initial() {
+        let env = Env::default();
+        let (contract_id, _admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+        assert_eq!(client.get_pool_balance(), 0);
     }
 
     #[test]
     #[should_panic(expected = "Loan amount must be positive")]
     fn test_request_loan_zero_amount() {
         let env = Env::default();
-        let farmer = Address::random(&env);
-        let admin = Address::random(&env);
-        let score_contract = Address::random(&env);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+        let score_contract = Address::generate(&env);
+        let farmer = Address::generate(&env);
 
-        MicroLoanContractImpl::set_score_contract(env.clone(), admin, score_contract);
-        MicroLoanContractImpl::request_loan(env, farmer, 0, 30);
+        env.mock_all_auths();
+        client.set_score_contract(&admin, &score_contract);
+        client.request_loan(&farmer, &0, &30);
     }
 
     #[test]
     #[should_panic(expected = "Term days must be between 1 and 3650")]
     fn test_request_loan_invalid_term() {
         let env = Env::default();
-        let farmer = Address::random(&env);
-        let admin = Address::random(&env);
-        let score_contract = Address::random(&env);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+        let score_contract = Address::generate(&env);
+        let farmer = Address::generate(&env);
 
-        MicroLoanContractImpl::set_score_contract(env.clone(), admin, score_contract);
-        MicroLoanContractImpl::request_loan(env, farmer, 100_000, 0);
+        env.mock_all_auths();
+        client.set_score_contract(&admin, &score_contract);
+        client.request_loan(&farmer, &100_000, &0);
     }
 
     #[test]
-    fn test_get_pool_balance() {
+    fn test_approve_loan_only_admin() {
         let env = Env::default();
-        let balance = MicroLoanContractImpl::get_pool_balance(env);
-        assert_eq!(balance, 0);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+        let non_admin = Address::generate(&env);
+
+        env.mock_all_auths();
+
+        // Trying to approve with a non-admin should panic
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.approve_loan(&non_admin, &1);
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_lender_balance_no_contribution() {
+        let env = Env::default();
+        let (contract_id, _admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+        let lender = Address::generate(&env);
+        assert_eq!(client.get_lender_balance(&lender), 0);
+    }
+
+    #[test]
+    fn test_set_score_contract_only_admin() {
+        let env = Env::default();
+        let (contract_id, _admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+        let non_admin = Address::generate(&env);
+        let score_contract = Address::generate(&env);
+
+        env.mock_all_auths();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_score_contract(&non_admin, &score_contract);
+        }));
+        assert!(result.is_err());
     }
 }

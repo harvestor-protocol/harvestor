@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, Symbol, Vec, Map};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, Vec};
 
 /// Unique score record for a farmer containing all attestation data
 #[derive(Clone)]
@@ -18,9 +18,48 @@ pub struct ScoreRecord {
     pub timestamp: u64,
 }
 
-/// Trait defining all contract functions
+/// Storage keys for the contract
+/// Using tuples as composite keys avoids symbol length limits and collisions.
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey {
+    /// The contract admin address
+    Admin,
+    /// List of authorized submitters (Vec<Address>)
+    Submitters,
+    /// Latest score for a specific farmer
+    LatestScore(Address),
+    /// Full score history for a specific farmer
+    ScoreHistory(Address),
+}
+
+/// The score attestation contract struct
 #[contract]
-pub trait ScoreAttestationContract {
+pub struct ScoreAttestation;
+
+#[contractimpl]
+impl ScoreAttestation {
+    /// Initialize the contract with an admin address.
+    ///
+    /// Must be called once after deployment. Sets the admin who can authorize
+    /// and revoke score submitters.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address (must sign the transaction)
+    pub fn initialize(env: Env, admin: Address) {
+        admin.require_auth();
+
+        // Prevent re-initialization
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("Contract already initialized");
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        // Initialize empty submitters list
+        let empty: Vec<Address> = vec![&env];
+        env.storage().persistent().set(&DataKey::Submitters, &empty);
+    }
+
     /// Authorize an organization as an approved score submitter.
     ///
     /// This function can only be called by the contract admin (verified via require_auth).
@@ -31,8 +70,40 @@ pub trait ScoreAttestationContract {
     /// * `org` - The organization address to whitelist as a submitter
     ///
     /// # Errors
-    /// Returns error if admin fails signature verification
-    fn authorize_submitter(env: Env, admin: Address, org: Address);
+    /// Returns error if admin fails signature verification or is not the stored admin
+    pub fn authorize_submitter(env: Env, admin: Address, org: Address) {
+        // Verify admin has signed this transaction
+        admin.require_auth();
+
+        // Verify the caller is the stored admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Contract not initialized"));
+
+        if admin != stored_admin {
+            panic!("Caller is not the admin");
+        }
+
+        // Get or create the authorized submitters list
+        let mut submitters: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Submitters)
+            .unwrap_or_else(|| vec![&env]);
+
+        // Check if org is already authorized (idempotent)
+        if submitters.iter().any(|s| s == org) {
+            return;
+        }
+
+        // Add org to authorized submitters
+        submitters.push_back(org);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Submitters, &submitters);
+    }
 
     /// Revoke an organization's authorization as a score submitter.
     ///
@@ -44,8 +115,39 @@ pub trait ScoreAttestationContract {
     /// * `org` - The organization address to remove from the whitelist
     ///
     /// # Errors
-    /// Returns error if admin fails signature verification
-    fn revoke_submitter(env: Env, admin: Address, org: Address);
+    /// Returns error if admin fails signature verification or is not the stored admin
+    pub fn revoke_submitter(env: Env, admin: Address, org: Address) {
+        // Verify admin has signed this transaction
+        admin.require_auth();
+
+        // Verify the caller is the stored admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Contract not initialized"));
+
+        if admin != stored_admin {
+            panic!("Caller is not the admin");
+        }
+
+        // Get the authorized submitters
+        let submitters: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Submitters)
+            .unwrap_or_else(|| vec![&env]);
+
+        // Filter out the org to revoke
+        let updated: Vec<Address> = submitters
+            .iter()
+            .filter(|s| s != org)
+            .collect();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Submitters, &updated);
+    }
 
     /// Submit a credit score attestation for a farmer.
     ///
@@ -63,106 +165,7 @@ pub trait ScoreAttestationContract {
     /// * Returns error if submitter is not authorized
     /// * Returns error if submitter fails signature verification
     /// * Returns error if score is outside the range [0, 100]
-    /// * Returns error if farmer or submitter address is invalid
-    fn submit_score(
-        env: Env,
-        submitter: Address,
-        farmer: Address,
-        score: u32,
-        evidence_hash: BytesN<32>,
-    );
-
-    /// Retrieve the most recent credit score for a farmer.
-    ///
-    /// Returns the latest ScoreRecord if one exists, or None if no scores
-    /// have been submitted for this farmer.
-    ///
-    /// # Arguments
-    /// * `farmer` - The farmer's address
-    ///
-    /// # Returns
-    /// Option containing the most recent ScoreRecord, or None if not found
-    fn get_score(env: Env, farmer: Address) -> Option<ScoreRecord>;
-
-    /// Retrieve the complete score history for a farmer.
-    ///
-    /// Returns all ScoreRecords for the farmer, ordered by timestamp
-    /// in ascending order (oldest first).
-    ///
-    /// # Arguments
-    /// * `farmer` - The farmer's address
-    ///
-    /// # Returns
-    /// Vector of all ScoreRecords for the farmer (empty if no history)
-    fn get_score_history(env: Env, farmer: Address) -> Vec<ScoreRecord>;
-}
-
-/// Struct implementing the contract trait
-#[contractimpl]
-pub struct ScoreAttestation;
-
-/// Storage key prefixes for efficient key management
-mod storage_keys {
-    use soroban_sdk::symbol_short;
-    
-    /// Prefix for authorized submitter list (stores addresses)
-    pub const SUBMITTERS: Symbol = symbol_short!("subs");
-    
-    /// Prefix for current/latest score (maps farmer -> ScoreRecord)
-    pub const LATEST_SCORE: Symbol = symbol_short!("lat");
-    
-    /// Prefix for score history (maps farmer -> Vec<ScoreRecord>)
-    pub const SCORE_HISTORY: Symbol = symbol_short!("hist");
-}
-
-#[contractimpl]
-impl ScoreAttestationContract for ScoreAttestation {
-    fn authorize_submitter(env: Env, admin: Address, org: Address) {
-        // Verify admin has signed this transaction
-        admin.require_auth();
-
-        // Get or create the authorized submitters set
-        let mut submitters: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&storage_keys::SUBMITTERS)
-            .unwrap_or_else(|| vec![&env]);
-
-        // Check if org is already authorized
-        if submitters.iter().any(|s| s == &org) {
-            return;
-        }
-
-        // Add org to authorized submitters
-        submitters.push_back(org);
-        env.storage()
-            .persistent()
-            .set(&storage_keys::SUBMITTERS, &submitters);
-    }
-
-    fn revoke_submitter(env: Env, admin: Address, org: Address) {
-        // Verify admin has signed this transaction
-        admin.require_auth();
-
-        // Get the authorized submitters
-        let submitters: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&storage_keys::SUBMITTERS)
-            .unwrap_or_else(|| vec![&env]);
-
-        // Filter out the org to revoke
-        let updated: Vec<Address> = submitters
-            .iter()
-            .filter(|s| s != &org)
-            .collect();
-
-        env.storage()
-            .persistent()
-            .set(&storage_keys::SUBMITTERS, &updated);
-    }
-
-    fn submit_score(
+    pub fn submit_score(
         env: Env,
         submitter: Address,
         farmer: Address,
@@ -181,10 +184,10 @@ impl ScoreAttestationContract for ScoreAttestation {
         let submitters: Vec<Address> = env
             .storage()
             .persistent()
-            .get(&storage_keys::SUBMITTERS)
+            .get(&DataKey::Submitters)
             .unwrap_or_else(|| vec![&env]);
 
-        if !submitters.iter().any(|s| s == &submitter) {
+        if !submitters.iter().any(|s| s == submitter) {
             panic!("Submitter is not authorized");
         }
 
@@ -200,34 +203,54 @@ impl ScoreAttestationContract for ScoreAttestation {
             timestamp,
         };
 
-        // Store as latest score
+        // Store as latest score (keyed per-farmer)
         env.storage()
             .persistent()
-            .set(&(&storage_keys::LATEST_SCORE, farmer.clone()), &record);
+            .set(&DataKey::LatestScore(farmer.clone()), &record);
 
-        // Add to history
+        // Append to history (keyed per-farmer)
         let mut history: Vec<ScoreRecord> = env
             .storage()
             .persistent()
-            .get(&(&storage_keys::SCORE_HISTORY, farmer.clone()))
+            .get(&DataKey::ScoreHistory(farmer.clone()))
             .unwrap_or_else(|| vec![&env]);
 
         history.push_back(record);
         env.storage()
             .persistent()
-            .set(&(&storage_keys::SCORE_HISTORY, farmer.clone()), &history);
+            .set(&DataKey::ScoreHistory(farmer.clone()), &history);
     }
 
-    fn get_score(env: Env, farmer: Address) -> Option<ScoreRecord> {
+    /// Retrieve the most recent credit score for a farmer.
+    ///
+    /// Returns the latest ScoreRecord if one exists, or None if no scores
+    /// have been submitted for this farmer.
+    ///
+    /// # Arguments
+    /// * `farmer` - The farmer's address
+    ///
+    /// # Returns
+    /// Option containing the most recent ScoreRecord, or None if not found
+    pub fn get_score(env: Env, farmer: Address) -> Option<ScoreRecord> {
         env.storage()
             .persistent()
-            .get(&(&storage_keys::LATEST_SCORE, farmer))
+            .get(&DataKey::LatestScore(farmer))
     }
 
-    fn get_score_history(env: Env, farmer: Address) -> Vec<ScoreRecord> {
+    /// Retrieve the complete score history for a farmer.
+    ///
+    /// Returns all ScoreRecords for the farmer, ordered by timestamp
+    /// in ascending order (oldest first).
+    ///
+    /// # Arguments
+    /// * `farmer` - The farmer's address
+    ///
+    /// # Returns
+    /// Vector of all ScoreRecords for the farmer (empty if no history)
+    pub fn get_score_history(env: Env, farmer: Address) -> Vec<ScoreRecord> {
         env.storage()
             .persistent()
-            .get(&(&storage_keys::SCORE_HISTORY, farmer))
+            .get(&DataKey::ScoreHistory(farmer))
             .unwrap_or_else(|| vec![&env])
     }
 }
@@ -235,60 +258,79 @@ impl ScoreAttestationContract for ScoreAttestation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, BytesN as _}, vec as soroban_vec};
+    use soroban_sdk::{testutils::{Address as _, BytesN as _}, Env};
+
+    fn setup_contract(env: &Env) -> (Address, Address) {
+        let admin = Address::generate(env);
+        let contract_id = env.register_contract(None, ScoreAttestation);
+        let client = ScoreAttestationClient::new(env, &contract_id);
+        env.mock_all_auths();
+        client.initialize(&admin);
+        (contract_id, admin)
+    }
+
+    #[test]
+    fn test_initialize() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, ScoreAttestation);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        env.mock_all_auths();
+        client.initialize(&admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract already initialized")]
+    fn test_initialize_twice_panics() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, ScoreAttestation);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.initialize(&admin); // second call should panic
+    }
 
     #[test]
     fn test_authorize_submitter() {
         let env = Env::default();
-        let admin = Address::random(&env);
-        let org = Address::random(&env);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let org = Address::generate(&env);
+        let farmer = Address::generate(&env);
+        let evidence_hash = BytesN::<32>::random(&env);
 
         env.mock_all_auths();
 
-        ScoreAttestation::authorize_submitter(env.clone(), admin.clone(), org.clone());
+        client.authorize_submitter(&admin, &org);
 
-        // Verify submitter is authorized by attempting to use it
-        let farmer = Address::random(&env);
-        let evidence_hash = BytesN::<32>::random(&env);
+        // Verify submitter is authorized by submitting a score
+        client.submit_score(&org, &farmer, &50, &evidence_hash);
 
-        // This should succeed because submitter is authorized
-        ScoreAttestation::submit_score(
-            env.clone(),
-            org.clone(),
-            farmer.clone(),
-            50,
-            evidence_hash.clone(),
-        );
-
-        let score = ScoreAttestation::get_score(env, farmer);
+        let score = client.get_score(&farmer);
         assert!(score.is_some());
     }
 
     #[test]
     fn test_revoke_submitter() {
         let env = Env::default();
-        let admin = Address::random(&env);
-        let org = Address::random(&env);
-        let farmer = Address::random(&env);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let org = Address::generate(&env);
+        let farmer = Address::generate(&env);
 
         env.mock_all_auths();
 
         // Authorize submitter
-        ScoreAttestation::authorize_submitter(env.clone(), admin.clone(), org.clone());
+        client.authorize_submitter(&admin, &org);
 
         // Revoke submitter
-        ScoreAttestation::revoke_submitter(env.clone(), admin, org.clone());
+        client.revoke_submitter(&admin, &org);
 
-        // Try to submit score - should fail
+        // Try to submit score after revocation - should fail
         let evidence_hash = BytesN::<32>::random(&env);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ScoreAttestation::submit_score(
-                env,
-                org,
-                farmer,
-                50,
-                evidence_hash,
-            );
+            client.submit_score(&org, &farmer, &50, &evidence_hash);
         }));
 
         assert!(result.is_err());
@@ -297,21 +339,17 @@ mod tests {
     #[test]
     fn test_submit_score_unauthorized() {
         let env = Env::default();
-        let unauthorized_org = Address::random(&env);
-        let farmer = Address::random(&env);
+        let (contract_id, _admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let unauthorized_org = Address::generate(&env);
+        let farmer = Address::generate(&env);
         let evidence_hash = BytesN::<32>::random(&env);
 
         env.mock_all_auths();
 
         // Try to submit score without being authorized - should fail
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ScoreAttestation::submit_score(
-                env,
-                unauthorized_org,
-                farmer,
-                50,
-                evidence_hash,
-            );
+            client.submit_score(&unauthorized_org, &farmer, &50, &evidence_hash);
         }));
 
         assert!(result.is_err());
@@ -320,27 +358,22 @@ mod tests {
     #[test]
     fn test_submit_score_valid() {
         let env = Env::default();
-        let admin = Address::random(&env);
-        let submitter = Address::random(&env);
-        let farmer = Address::random(&env);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let submitter = Address::generate(&env);
+        let farmer = Address::generate(&env);
         let evidence_hash = BytesN::<32>::random(&env);
 
         env.mock_all_auths();
 
         // Authorize submitter
-        ScoreAttestation::authorize_submitter(env.clone(), admin, submitter.clone());
+        client.authorize_submitter(&admin, &submitter);
 
         // Submit score
-        ScoreAttestation::submit_score(
-            env.clone(),
-            submitter,
-            farmer.clone(),
-            75,
-            evidence_hash.clone(),
-        );
+        client.submit_score(&submitter, &farmer, &75, &evidence_hash);
 
         // Verify score was stored
-        let record = ScoreAttestation::get_score(env, farmer);
+        let record = client.get_score(&farmer);
         assert!(record.is_some());
         let record = record.unwrap();
         assert_eq!(record.score, 75);
@@ -350,79 +383,60 @@ mod tests {
     #[test]
     fn test_submit_score_out_of_range() {
         let env = Env::default();
-        let admin = Address::random(&env);
-        let submitter = Address::random(&env);
-        let farmer = Address::random(&env);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let submitter = Address::generate(&env);
+        let farmer = Address::generate(&env);
         let evidence_hash = BytesN::<32>::random(&env);
 
         env.mock_all_auths();
 
         // Authorize submitter
-        ScoreAttestation::authorize_submitter(env.clone(), admin, submitter.clone());
+        client.authorize_submitter(&admin, &submitter);
 
         // Try to submit score > 100 - should fail
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ScoreAttestation::submit_score(
-                env.clone(),
-                submitter.clone(),
-                farmer.clone(),
-                101,
-                evidence_hash.clone(),
-            );
+            client.submit_score(&submitter, &farmer, &101, &evidence_hash);
         }));
 
         assert!(result.is_err());
 
-        // Try to submit score with value that would overflow in theory
-        // (u32 can't be negative, but let's test the boundary)
-        let result2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ScoreAttestation::submit_score(
-                env,
-                submitter,
-                farmer,
-                u32::MAX,
-                evidence_hash,
-            );
-        }));
-
-        assert!(result2.is_err());
+        // Score at boundary (100) should succeed
+        client.submit_score(&submitter, &farmer, &100, &evidence_hash);
+        let record = client.get_score(&farmer);
+        assert_eq!(record.unwrap().score, 100);
     }
 
     #[test]
     fn test_score_history_ordering() {
         let env = Env::default();
-        let admin = Address::random(&env);
-        let submitter = Address::random(&env);
-        let farmer = Address::random(&env);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let submitter = Address::generate(&env);
+        let farmer = Address::generate(&env);
 
         env.mock_all_auths();
 
         // Authorize submitter
-        ScoreAttestation::authorize_submitter(env.clone(), admin, submitter.clone());
+        client.authorize_submitter(&admin, &submitter);
 
         // Submit multiple scores
-        for i in 0..3 {
+        for i in 0u32..3 {
             let evidence_hash = BytesN::<32>::random(&env);
-            ScoreAttestation::submit_score(
-                env.clone(),
-                submitter.clone(),
-                farmer.clone(),
-                30 + (i * 20),
-                evidence_hash,
-            );
+            client.submit_score(&submitter, &farmer, &(30 + i * 20), &evidence_hash);
         }
 
         // Get history
-        let history = ScoreAttestation::get_score_history(env, farmer);
+        let history = client.get_score_history(&farmer);
 
-        // Verify all scores are present and ordered by timestamp
+        // Verify all scores are present and ordered by submission (oldest first)
         assert_eq!(history.len(), 3);
         assert_eq!(history.get(0).unwrap().score, 30);
         assert_eq!(history.get(1).unwrap().score, 50);
         assert_eq!(history.get(2).unwrap().score, 70);
 
         // Verify timestamps are in ascending order
-        for i in 0..2 {
+        for i in 0..2u32 {
             assert!(history.get(i).unwrap().timestamp <= history.get(i + 1).unwrap().timestamp);
         }
     }
@@ -430,90 +444,96 @@ mod tests {
     #[test]
     fn test_get_score_latest() {
         let env = Env::default();
-        let admin = Address::random(&env);
-        let submitter = Address::random(&env);
-        let farmer = Address::random(&env);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let submitter = Address::generate(&env);
+        let farmer = Address::generate(&env);
 
         env.mock_all_auths();
 
         // Authorize submitter
-        ScoreAttestation::authorize_submitter(env.clone(), admin, submitter.clone());
+        client.authorize_submitter(&admin, &submitter);
 
         // Submit multiple scores
-        for i in 0..3 {
+        for i in 0u32..3 {
             let evidence_hash = BytesN::<32>::random(&env);
-            ScoreAttestation::submit_score(
-                env.clone(),
-                submitter.clone(),
-                farmer.clone(),
-                30 + (i * 20),
-                evidence_hash,
-            );
+            client.submit_score(&submitter, &farmer, &(30 + i * 20), &evidence_hash);
         }
 
-        // Get latest score
-        let latest = ScoreAttestation::get_score(env, farmer);
+        // get_score should return the latest submitted score
+        let latest = client.get_score(&farmer);
         assert!(latest.is_some());
-        assert_eq!(latest.unwrap().score, 70); // Should be the last submitted score
+        assert_eq!(latest.unwrap().score, 70);
     }
 
     #[test]
     fn test_get_score_nonexistent_farmer() {
         let env = Env::default();
-        let farmer = Address::random(&env);
+        let (contract_id, _admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let farmer = Address::generate(&env);
 
         // Try to get score for farmer with no history
-        let score = ScoreAttestation::get_score(env, farmer);
+        let score = client.get_score(&farmer);
         assert!(score.is_none());
     }
 
     #[test]
     fn test_get_history_nonexistent_farmer() {
         let env = Env::default();
-        let farmer = Address::random(&env);
+        let (contract_id, _admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let farmer = Address::generate(&env);
 
         // Get history for farmer with no scores
-        let history = ScoreAttestation::get_score_history(env, farmer);
+        let history = client.get_score_history(&farmer);
         assert_eq!(history.len(), 0);
     }
 
     #[test]
     fn test_multiple_farmers() {
         let env = Env::default();
-        let admin = Address::random(&env);
-        let submitter = Address::random(&env);
-        let farmer1 = Address::random(&env);
-        let farmer2 = Address::random(&env);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let submitter = Address::generate(&env);
+        let farmer1 = Address::generate(&env);
+        let farmer2 = Address::generate(&env);
 
         env.mock_all_auths();
 
         // Authorize submitter
-        ScoreAttestation::authorize_submitter(env.clone(), admin, submitter.clone());
+        client.authorize_submitter(&admin, &submitter);
 
         // Submit scores for different farmers
         let evidence_hash1 = BytesN::<32>::random(&env);
-        ScoreAttestation::submit_score(
-            env.clone(),
-            submitter.clone(),
-            farmer1.clone(),
-            50,
-            evidence_hash1,
-        );
+        client.submit_score(&submitter, &farmer1, &50, &evidence_hash1);
 
         let evidence_hash2 = BytesN::<32>::random(&env);
-        ScoreAttestation::submit_score(
-            env.clone(),
-            submitter.clone(),
-            farmer2.clone(),
-            75,
-            evidence_hash2,
-        );
+        client.submit_score(&submitter, &farmer2, &75, &evidence_hash2);
 
         // Verify both scores are independent
-        let score1 = ScoreAttestation::get_score(env.clone(), farmer1);
-        let score2 = ScoreAttestation::get_score(env, farmer2);
+        let score1 = client.get_score(&farmer1);
+        let score2 = client.get_score(&farmer2);
 
         assert_eq!(score1.unwrap().score, 50);
         assert_eq!(score2.unwrap().score, 75);
+    }
+
+    #[test]
+    fn test_non_admin_cannot_authorize() {
+        let env = Env::default();
+        let (contract_id, _admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let non_admin = Address::generate(&env);
+        let org = Address::generate(&env);
+
+        env.mock_all_auths();
+
+        // A non-admin should not be able to authorize a submitter
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.authorize_submitter(&non_admin, &org);
+        }));
+
+        assert!(result.is_err());
     }
 }
