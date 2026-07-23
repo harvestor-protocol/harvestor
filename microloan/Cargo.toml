@@ -8,6 +8,7 @@ soroban-sdk = "20.0"
 
 [dev-dependencies]
 soroban-sdk = { version = "20.0", features = ["testutils"] }
+score_attestation = { path = "../score_attestation" }
 
 [lib]
 crate-type = ["cdylib"]
