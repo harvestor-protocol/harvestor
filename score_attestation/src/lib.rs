@@ -1,5 +1,22 @@
 #![no_std]
 
+//! # Score Attestation Contract
+//!
+//! Allows authorized farming cooperatives and data providers to submit
+//! verifiable on-chain credit score attestations (0-100) for smallholder
+//! farmers. Each attestation links to off-chain evidence via a SHA-256
+//! hash. Farmers accumulate an immutable, portable credit history that
+//! lenders (for example the companion microloan contract) can query via
+//! cross-contract calls.
+//!
+//! ## Authorization model
+//!
+//! - The **admin** (set once at [`ScoreAttestation::initialize`]) manages
+//!   the whitelist of authorized submitters.
+//! - Only whitelisted submitters can call
+//!   [`ScoreAttestation::submit_score`].
+//! - Read functions are permissionless.
+
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Vec};
 
 /// Unique score record for a farmer containing all attestation data
@@ -46,6 +63,10 @@ impl ScoreAttestation {
     ///
     /// # Arguments
     /// * `admin` - The admin address (must sign the transaction)
+    ///
+    /// # Panics
+    /// Panics with "Contract already initialized" if the contract has
+    /// already been initialized.
     pub fn initialize(env: Env, admin: Address) {
         admin.require_auth();
 
@@ -69,8 +90,10 @@ impl ScoreAttestation {
     /// * `admin` - The admin address (must sign the transaction)
     /// * `org` - The organization address to whitelist as a submitter
     ///
-    /// # Errors
-    /// Returns error if admin fails signature verification or is not the stored admin
+    /// # Panics
+    /// * Panics if `admin` fails signature verification (`require_auth`)
+    /// * Panics with "Contract not initialized" if `initialize` was never called
+    /// * Panics with "Caller is not the admin" if `admin` is not the stored admin
     pub fn authorize_submitter(env: Env, admin: Address, org: Address) {
         // Verify admin has signed this transaction
         admin.require_auth();
@@ -114,8 +137,10 @@ impl ScoreAttestation {
     /// * `admin` - The admin address (must sign the transaction)
     /// * `org` - The organization address to remove from the whitelist
     ///
-    /// # Errors
-    /// Returns error if admin fails signature verification or is not the stored admin
+    /// # Panics
+    /// * Panics if `admin` fails signature verification (`require_auth`)
+    /// * Panics with "Contract not initialized" if `initialize` was never called
+    /// * Panics with "Caller is not the admin" if `admin` is not the stored admin
     pub fn revoke_submitter(env: Env, admin: Address, org: Address) {
         // Verify admin has signed this transaction
         admin.require_auth();
@@ -163,10 +188,12 @@ impl ScoreAttestation {
     /// * `score` - Credit score (must be 0-100)
     /// * `evidence_hash` - 32-byte hash of off-chain evidence (e.g. SHA-256)
     ///
-    /// # Errors
-    /// * Returns error if submitter is not authorized
-    /// * Returns error if submitter fails signature verification
-    /// * Returns error if score is outside the range [0, 100]
+    /// # Panics
+    /// * Panics with "Score must be between 0 and 100" if `score` is outside
+    ///   the range [0, 100]
+    /// * Panics with "Submitter is not authorized" if `submitter` is not on
+    ///   the admin-managed whitelist
+    /// * Panics if `submitter` fails signature verification (`require_auth`)
     pub fn submit_score(
         env: Env,
         submitter: Address,
