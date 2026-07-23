@@ -203,6 +203,17 @@ impl ScoreAttestation {
             timestamp,
         };
 
+        // Emit ScoreSubmitted event — (score, submitter, timestamp).
+        // Topics: ("score_submitted", farmer) so indexers can subscribe
+        // per-farmer and per-event-type.
+        env.events().publish(
+            (
+                symbol_short!("score_submitted"),
+                farmer.clone(),
+            ),
+            (score, submitter.clone(), timestamp),
+        );
+
         // Store as latest score (keyed per-farmer)
         env.storage()
             .persistent()
@@ -535,5 +546,34 @@ mod tests {
         }));
 
         assert!(result.is_err());
+    }
+
+    // --- ScoreSubmitted event test (issue #11) ---
+
+    #[test]
+    fn test_score_submitted_event_emitted() {
+        let env = Env::default();
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+        client.authorize_submitter(&admin, &submitter);
+        let farmer = Address::generate(&env);
+        let evidence_hash = BytesN::<32>::random(&env);
+        env.mock_all_auths();
+        client.submit_score(&submitter, &farmer, &85, &evidence_hash);
+
+        // Expect at least one event with the topic tuple
+        // ("score_submitted", farmer).
+        let events = env.events().all();
+        assert!(!events.is_empty(), "no events emitted");
+        // The latest event should reference our farmer.
+        let found = events.iter().any(|(_, topics, _)| match topics {
+            soroban_sdk::Vec::<_>::Arr(items) => items
+                .iter()
+                .any(|t| t == symbol_short!("score_submitted")),
+            _ => false,
+        });
+        assert!(found, "score_submitted event not found in topics");
     }
 }
