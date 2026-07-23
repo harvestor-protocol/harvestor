@@ -133,6 +133,43 @@ npm test -- --coverage
 
 For testing cross-contract calls between score-attestation and microloan, deploy both contracts to Stellar testnet (see QUICKSTART.md for deployment instructions) and invoke them via Soroban CLI. Examples are in `microloan/LOAN_LIFECYCLE.md`.
 
+## Running CI Checks Locally
+
+Every pull request runs the CI workflow in `.github/workflows/ci.yml`
+(format check, Clippy, contract unit tests, WASM build). Run the same
+checks locally before pushing:
+
+```bash
+# Use the same toolchain as CI (see "Toolchain compatibility" below)
+rustup toolchain install 1.88.0 --component rustfmt --component clippy
+rustup target add wasm32-unknown-unknown --toolchain 1.88.0
+
+# For each contract directory (score_attestation/ and microloan/):
+cd score_attestation
+cargo +1.88.0 fmt --check
+cargo +1.88.0 clippy --all-targets -- -D warnings
+cargo +1.88.0 test --lib
+cargo +1.88.0 build --target wasm32-unknown-unknown --release
+cd ../microloan
+cargo +1.88.0 fmt --check
+cargo +1.88.0 clippy --all-targets -- -D warnings
+cargo +1.88.0 test --lib
+cargo +1.88.0 build --target wasm32-unknown-unknown --release
+```
+
+### Toolchain compatibility (why 1.88.0 is pinned)
+
+- `soroban-sdk` 21's dependency tree requires rustc >= 1.88
+  (`darling` 0.23, `serde_with` 3.21 declare that MSRV).
+- The contracts were originally written against `soroban-sdk` 20, whose
+  pinned dependencies no longer compile or test correctly on modern
+  Rust (`ethnum` 1.5.0 fails on recent rustc, and host panic handling
+  in `soroban-env-host` 20.x aborts the test process on rustc >= 1.81).
+- `ed25519-dalek` is pinned to 2.2.0 via the committed `Cargo.lock`
+  files: `soroban-env-host` 21.2.1 is incompatible with
+  `ed25519-dalek` 3.0 (rand_core 0.10 trait conflict). Do not delete
+  the lockfiles; CI relies on them for a reproducible dependency set.
+
 ## Git Conventions
 
 ### Branch Naming
