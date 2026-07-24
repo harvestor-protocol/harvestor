@@ -1,5 +1,18 @@
 #![no_std]
 
+//! # Microloan Contract
+//!
+//! USDC-denominated microloans for smallholder farmers, gated by the
+//! on-chain credit scores recorded in the companion score-attestation
+//! contract. Lenders pool capital; farmers request loans that the admin
+//! approves; repayments (full or partial) return capital to the pool and
+//! feed the farmer's on-chain repayment history.
+//!
+//! ## Lifecycle
+//!
+//! `Pending -> Active -> Repaid` (or `Defaulted` after term expiry).
+//! See [`LoanStatus`].
+
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, IntoVal, Vec,
 };
@@ -69,10 +82,15 @@ pub enum DataKey {
 #[derive(Clone)]
 #[contracttype]
 pub struct ScoreRecord {
+    /// The farmer's Stellar address
     pub farmer: Address,
+    /// Credit score (0-100)
     pub score: u32,
+    /// Hash of off-chain evidence supporting the score
     pub evidence_hash: BytesN<32>,
+    /// Address of the organization that submitted the score
     pub submitter: Address,
+    /// UNIX timestamp when the score was recorded
     pub timestamp: u64,
 }
 
@@ -92,6 +110,10 @@ impl MicroLoanContract {
     ///
     /// # Arguments
     /// * `admin` - The admin address (must sign the transaction)
+    ///
+    /// # Panics
+    /// Panics with "Contract already initialized" if the contract has
+    /// already been initialized.
     pub fn initialize(env: Env, admin: Address) {
         admin.require_auth();
 
@@ -111,6 +133,11 @@ impl MicroLoanContract {
     /// # Arguments
     /// * `admin` - The admin address (must sign the transaction)
     /// * `score_contract` - The contract address of the score-attestation contract
+    ///
+    /// # Panics
+    /// * Panics if `admin` fails signature verification (`require_auth`)
+    /// * Panics with "Contract not initialized" if `initialize` was never called
+    /// * Panics with "Caller is not the admin" if `admin` is not the stored admin
     pub fn set_score_contract(env: Env, admin: Address, score_contract: Address) {
         admin.require_auth();
 
@@ -136,7 +163,10 @@ impl MicroLoanContract {
     ///
     /// # Arguments
     /// * `lender` - The lender's address (must sign the transaction)
-    /// * `amount` - Amount to deposit (must be > 0)
+    /// * `amount` - Amount to deposit in microunits (must be > 0)
+    ///
+    /// # Panics
+    /// Panics with "Fund amount must be positive" if `amount` <= 0.
     pub fn fund_pool(env: Env, lender: Address, amount: i128) {
         lender.require_auth();
 
@@ -181,8 +211,19 @@ impl MicroLoanContract {
     ///
     /// # Arguments
     /// * `farmer` - The farmer's address (must sign the transaction)
-    /// * `amount` - Loan amount requested (must be > 0)
+    /// * `amount` - Loan amount requested in microunits (must be > 0)
     /// * `term_days` - Loan term in days (must be 1–3650)
+    ///
+    /// # Panics
+    /// * Panics with "Loan amount must be positive" if `amount` <= 0
+    /// * Panics with "Term days must be between 1 and 3650" if `term_days`
+    ///   is 0 or greater than 3650
+    /// * Panics with "Score contract not configured" if
+    ///   [`MicroLoanContract::set_score_contract`] was never called
+    /// * Panics with "Farmer has no credit score on record" if the
+    ///   score-attestation contract has no score for `farmer`
+    /// * Panics with "Farmer credit score below minimum threshold" if the
+    ///   farmer's latest score is below `MIN_CREDIT_SCORE`
     pub fn request_loan(env: Env, farmer: Address, amount: i128, term_days: u32) {
         farmer.require_auth();
 
@@ -283,6 +324,15 @@ impl MicroLoanContract {
     /// # Arguments
     /// * `approver` - The approver's address (must sign the transaction, must be admin)
     /// * `loan_id` - The loan ID to approve
+    ///
+    /// # Panics
+    /// * Panics with "Only admin can approve loans" if `approver` is not
+    ///   the stored admin
+    /// * Panics with "Loan not found" if no loan exists with `loan_id`
+    /// * Panics with "Loan is not in Pending status" if the loan was
+    ///   already approved, repaid, or defaulted
+    /// * Panics with "Insufficient funds in pool" if the pool balance is
+    ///   below the loan amount
     pub fn approve_loan(env: Env, approver: Address, loan_id: u64) {
         approver.require_auth();
 
@@ -340,7 +390,17 @@ impl MicroLoanContract {
     /// # Arguments
     /// * `farmer` - The farmer's address (must sign the transaction)
     /// * `loan_id` - The loan ID to repay
-    /// * `amount` - Repayment amount (must be > 0 and <= remaining balance)
+    /// * `amount` - Repayment amount in microunits (must be > 0 and <=
+    ///   remaining balance)
+    ///
+    /// # Panics
+    /// * Panics with "Repayment amount must be positive" if `amount` <= 0
+    /// * Panics with "Loan not found" if no loan exists with `loan_id`
+    /// * Panics with "Loan is not Active" if the loan is not in Active status
+    /// * Panics with "Only the loan farmer can repay this loan" if `farmer`
+    ///   is not the loan's borrower
+    /// * Panics with "Repayment amount exceeds remaining balance" on
+    ///   overpayment
     pub fn repay_loan(env: Env, farmer: Address, loan_id: u64, amount: i128) {
         farmer.require_auth();
 
@@ -402,6 +462,15 @@ impl MicroLoanContract {
     /// # Arguments
     /// * `admin` - The admin address (must sign the transaction)
     /// * `loan_id` - The loan ID to mark as defaulted
+    ///
+    /// # Panics
+    /// * Panics with "Only admin can mark loans as defaulted" if `admin`
+    ///   is not the stored admin
+    /// * Panics with "Loan not found" if no loan exists with `loan_id`
+    /// * Panics with "Loan must be Active to be marked as defaulted" if the
+    ///   loan is not in Active status
+    /// * Panics with "Loan term has not yet expired" if the loan's `due_at`
+    ///   timestamp is still in the future
     pub fn mark_defaulted(env: Env, admin: Address, loan_id: u64) {
         admin.require_auth();
 
