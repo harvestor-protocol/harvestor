@@ -575,5 +575,66 @@ mod tests {
             _ => false,
         });
         assert!(found, "score_submitted event not found in topics");
+    // --- Boundary tests for score validation (issue #6) ---
+
+    fn setup_with_authorized_submitter(env: &Env) -> (ScoreAttestationClient, Address, BytesN<32>) {
+        let (contract_id, admin) = setup_contract(env);
+        let client = ScoreAttestationClient::new(env, &contract_id);
+        let submitter = Address::generate(env);
+        env.mock_all_auths();
+        client.authorize_submitter(&admin, &submitter);
+        let evidence_hash = BytesN::<32>::random(env);
+        (client, submitter, evidence_hash)
+    }
+
+    #[test]
+    fn test_score_boundary_zero_min_valid() {
+        let env = Env::default();
+        let (client, submitter, evidence_hash) = setup_with_authorized_submitter(&env);
+        let farmer = Address::generate(&env);
+
+        // Score = 0 is the minimum valid value
+        client.submit_score(&submitter, &farmer, &0, &evidence_hash);
+
+        let stored = client.get_score(&farmer);
+        assert!(stored.is_some(), "score=0 should be accepted");
+        assert_eq!(stored.unwrap().score, 0, "score=0 should be stored as 0");
+    }
+
+    #[test]
+    fn test_score_boundary_hundred_max_valid() {
+        let env = Env::default();
+        let (client, submitter, evidence_hash) = setup_with_authorized_submitter(&env);
+        let farmer = Address::generate(&env);
+
+        // Score = 100 is the maximum valid value
+        client.submit_score(&submitter, &farmer, &100, &evidence_hash);
+
+        let stored = client.get_score(&farmer);
+        assert!(stored.is_some(), "score=100 should be accepted");
+        assert_eq!(stored.unwrap().score, 100, "score=100 should be stored as 100");
+    }
+
+    #[test]
+    #[should_panic(expected = "Score must be between 0 and 100")]
+    fn test_score_boundary_hundred_one_invalid() {
+        let env = Env::default();
+        let (client, submitter, evidence_hash) = setup_with_authorized_submitter(&env);
+        let farmer = Address::generate(&env);
+
+        // Score = 101 must be rejected
+        client.submit_score(&submitter, &farmer, &101, &evidence_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "Score must be between 0 and 100")]
+    fn test_score_boundary_u32_max_invalid() {
+        let env = Env::default();
+        let (client, submitter, evidence_hash) = setup_with_authorized_submitter(&env);
+        let farmer = Address::generate(&env);
+
+        // Score = u32::MAX must be rejected
+        let max_score: u32 = u32::MAX;
+        client.submit_score(&submitter, &farmer, &max_score, &evidence_hash);
     }
 }

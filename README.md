@@ -509,6 +509,8 @@ Harvestor is open-source and welcomes contributions from developers, researchers
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines on code style, commit messages, and the review process.
 
+If this is your first contribution, the [First Contribution Walkthrough](./docs/FIRST_CONTRIBUTION.md) walks you through a real example task end-to-end and is the fastest way to get a PR merged.
+
 ## License
 
 MIT License. See [LICENSE](./LICENSE) for details.
