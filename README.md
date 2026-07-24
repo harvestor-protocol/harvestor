@@ -542,3 +542,26 @@ If you use Harvestor in research or deployment, please cite:
 Harvestor is early-stage infrastructure for credit and lending on Stellar. It is not production-ready and has not been audited. Use on testnet only until further notice.
 
 **Support Open-Source Fintech**: If you find Harvestor useful and want to support its development, consider applying for the [Stellar Wave Grant Program](https://stellar.org/grants-and-funding) or nominating it for funding.
+
+## Contract Events
+
+Both contracts emit on-chain events for off-chain indexers (dashboards, risk monitoring, analytics):
+
+| Contract | Event | Topics | Data |
+|----------|-------|--------|------|
+| `score_attestation` | `score_submitted` | `("score_submitted", farmer)` | `(score, submitter, timestamp)` |
+| `microloan` | `pool_funded` | `("pool_funded", lender)` | `(amount, new_pool_balance)` |
+| `microloan` | `loan_requested` | `("loan_requested", farmer)` | `(loan_id, amount, term_days)` |
+| `microloan` | `loan_approved` | `("loan_approved", loan_id)` | `(approver, approved_at)` |
+| `microloan` | `loan_repaid` | `("loan_repaid", loan_id)` | `(farmer, amount, new_remaining, repaid_at)` |
+| `microloan` | `loan_defaulted` | `("loan_defaulted", loan_id)` | `(farmer, defaulted_at)` |
+
+Subscribing to a per-farmer feed:
+
+```python
+# Pseudo-code for an off-chain indexer listening to Stellar Horizon.
+# Real implementation: see https://developers.stellar.org/network/horizon
+for event in horizon.events(topics=[["score_submitted", farmer_addr]]):
+    score, submitter, ts = event.data
+    # ...
+```
