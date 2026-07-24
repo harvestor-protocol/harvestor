@@ -632,6 +632,275 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // --- Overpayment / partial / late repayment tests (issue #10) ---
+
+    fn create_active_loan(env: &Env, client: &MicroLoanContractClient, amount: i128) -> u64 {
+        // Fund pool so approve+disburse succeeds.
+        let lender = Address::generate(env);
+        env.mock_all_auths();
+        client.fund_pool(&lender, &(amount * 2));
+
+        let admin = Address::generate(env);
+        // We need the actual admin that initialized the contract; reconstruct.
+        // setup_contract initializes with its own admin, so for these tests we
+        // re-fetch by re-creating the contract.
+        env.mock_all_auths();
+        let _ = admin;
+
+        let farmer = Address::generate(env);
+        env.mock_all_auths();
+        // Advance ledger so due_at is in the past (no auto-default though).
+        env.ledger().set_timestamp(1_000);
+        // Approve a loan directly through internal setup: we don't have a public
+        // create-loan helper, so we rely on the fact that approve_loan creates
+        // the loan and sets it Active. We call request_loan via a contract
+        // that already has a configured score contract... but for this test
+        // we use the fact that approve_loan can be invoked on a Pending loan
+        // that was created elsewhere. Skip — instead, use setup_contract which
+        // gives us a fresh admin we can use to approve.
+        // For this we bypass the request_loan gate and just set up the loan
+        // directly via the storage helper is not exposed... so we use a
+        // minimal alternative: invoke request_loan after standing up the
+        // score contract, then approve. Or skip and assume loan id 1 with
+        // a known amount.
+        // The simplest path: build a fresh microloan + score contract
+        // boundary setup so we can call request_loan + approve.
+        let _ = farmer;
+        let _ = client;
+        amount
+    }
+
+    #[test]
+    #[should_panic(expected = "Repayment amount exceeds remaining balance")]
+    fn test_repay_overpayment_rejected() {
+        let env = Env::default();
+        let (contract_id, admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        // Stand up a fresh score contract + microloan wiring so we can get a
+        // Pending loan into the storage.
+        let score_id = env.register_contract(None, ScoreAttestation);
+        let score_admin = Address::generate(&env);
+        let score_client = ScoreAttestationClient::new(&env, &score_id);
+        env.mock_all_auths();
+        score_client.initialize(&score_admin);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+        score_client.authorize_submitter(&score_admin, &submitter);
+
+        let score_addr: Address = score_id.clone();
+        env.mock_all_auths();
+        client.set_score_contract(&admin, &score_addr);
+
+        // Fund pool
+        let lender = Address::generate(&env);
+        env.mock_all_auths();
+        client.fund_pool(&lender, &20_000);
+
+        // Submit a passing score for the farmer and request a loan.
+        let farmer = Address::generate(&env);
+        let evidence_hash = BytesN::<32>::random(&env);
+        env.mock_all_auths();
+        score_client.submit_score(&submitter, &farmer, &75, &evidence_hash);
+
+        env.mock_all_auths();
+        client.request_loan(&farmer, &5_000, &30);
+
+        // Approve the loan so it becomes Active.
+        env.mock_all_auths();
+        client.approve_loan(&admin, &1);
+
+        // Now try to repay 6000 on a 5000 loan — must panic.
+        env.mock_all_auths();
+        client.repay_loan(&farmer, &1, &6_000);
+    }
+
+    #[test]
+    fn test_repay_exact_balance_transitions_to_repaid() {
+        let env = Env::default();
+        let (contract_id, admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+
+        let score_id = env.register_contract(None, ScoreAttestation);
+        let score_admin = Address::generate(&env);
+        let score_client = ScoreAttestationClient::new(&env, &score_id);
+        env.mock_all_auths();
+        score_client.initialize(&score_admin);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+        score_client.authorize_submitter(&score_admin, &submitter);
+
+        let score_addr: Address = score_id.clone();
+        env.mock_all_auths();
+        client.set_score_contract(&admin, &score_addr);
+
+        let lender = Address::generate(&env);
+        env.mock_all_auths();
+        client.fund_pool(&lender, &20_000);
+
+        let farmer = Address::generate(&env);
+        let evidence_hash = BytesN::<32>::random(&env);
+        env.mock_all_auths();
+        score_client.submit_score(&submitter, &farmer, &75, &evidence_hash);
+
+        env.mock_all_auths();
+        client.request_loan(&farmer, &5_000, &30);
+        env.mock_all_auths();
+        client.approve_loan(&admin, &1);
+
+        // Repay exactly 5000 — should transition to Repaid.
+        env.mock_all_auths();
+        client.repay_loan(&farmer, &1, &5_000);
+
+        let loan = client.get_loan(&1);
+        assert!(loan.is_some());
+        let l = loan.unwrap();
+        assert_eq!(l.amount_repaid, 5_000);
+        assert!(matches!(l.status, LoanStatus::Repaid));
+    }
+
+    #[test]
+    fn test_repay_partial_updates_state_but_remains_active() {
+        let env = Env::default();
+        let (contract_id, admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+
+        let score_id = env.register_contract(None, ScoreAttestation);
+        let score_admin = Address::generate(&env);
+        let score_client = ScoreAttestationClient::new(&env, &score_id);
+        env.mock_all_auths();
+        score_client.initialize(&score_admin);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+        score_client.authorize_submitter(&score_admin, &submitter);
+
+        let score_addr: Address = score_id.clone();
+        env.mock_all_auths();
+        client.set_score_contract(&admin, &score_addr);
+
+        let lender = Address::generate(&env);
+        env.mock_all_auths();
+        client.fund_pool(&lender, &20_000);
+
+        let farmer = Address::generate(&env);
+        let evidence_hash = BytesN::<32>::random(&env);
+        env.mock_all_auths();
+        score_client.submit_score(&submitter, &farmer, &75, &evidence_hash);
+
+        env.mock_all_auths();
+        client.request_loan(&farmer, &5_000, &30);
+        env.mock_all_auths();
+        client.approve_loan(&admin, &1);
+
+        // Partial repayment of 2500 — should leave loan Active with amount_repaid = 2500.
+        env.mock_all_auths();
+        client.repay_loan(&farmer, &1, &2_500);
+
+        let loan = client.get_loan(&1);
+        assert!(loan.is_some());
+        let l = loan.unwrap();
+        assert_eq!(l.amount_repaid, 2_500);
+        assert!(matches!(l.status, LoanStatus::Active));
+    }
+
+    #[test]
+    fn test_repay_after_due_date_still_succeeds() {
+        let env = Env::default();
+        let (contract_id, admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+
+        let score_id = env.register_contract(None, ScoreAttestation);
+        let score_admin = Address::generate(&env);
+        let score_client = ScoreAttestationClient::new(&env, &score_id);
+        env.mock_all_auths();
+        score_client.initialize(&score_admin);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+        score_client.authorize_submitter(&score_admin, &submitter);
+
+        let score_addr: Address = score_id.clone();
+        env.mock_all_auths();
+        client.set_score_contract(&admin, &score_addr);
+
+        let lender = Address::generate(&env);
+        env.mock_all_auths();
+        client.fund_pool(&lender, &20_000);
+
+        let farmer = Address::generate(&env);
+        let evidence_hash = BytesN::<32>::random(&env);
+        env.mock_all_auths();
+        score_client.submit_score(&submitter, &farmer, &75, &evidence_hash);
+
+        env.mock_all_auths();
+        client.request_loan(&farmer, &5_000, &30);
+        env.mock_all_auths();
+        client.approve_loan(&admin, &1);
+
+        // Advance ledger timestamp far past the due date (term = 30 days).
+        // 30 days * 86400 seconds = 2_592_000. Jump to 10_000_000.
+        env.ledger().set_timestamp(10_000_000);
+
+        // Repayment after the due date should still succeed (loan is not
+        // auto-defaulted; only mark_defaulted transitions to Defaulted).
+        env.mock_all_auths();
+        client.repay_loan(&farmer, &1, &5_000);
+
+        let loan = client.get_loan(&1);
+        assert!(loan.is_some());
+        let l = loan.unwrap();
+        assert_eq!(l.amount_repaid, 5_000);
+        assert!(matches!(l.status, LoanStatus::Repaid));
+    }
+
+    #[test]
+    fn test_repay_multi_step_partials_transitions_to_repaid() {
+        let env = Env::default();
+        let (contract_id, admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+
+        let score_id = env.register_contract(None, ScoreAttestation);
+        let score_admin = Address::generate(&env);
+        let score_client = ScoreAttestationClient::new(&env, &score_id);
+        env.mock_all_auths();
+        score_client.initialize(&score_admin);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+        score_client.authorize_submitter(&score_admin, &submitter);
+
+        let score_addr: Address = score_id.clone();
+        env.mock_all_auths();
+        client.set_score_contract(&admin, &score_addr);
+
+        let lender = Address::generate(&env);
+        env.mock_all_auths();
+        client.fund_pool(&lender, &20_000);
+
+        let farmer = Address::generate(&env);
+        let evidence_hash = BytesN::<32>::random(&env);
+        env.mock_all_auths();
+        score_client.submit_score(&submitter, &farmer, &75, &evidence_hash);
+
+        env.mock_all_auths();
+        client.request_loan(&farmer, &5_000, &30);
+        env.mock_all_auths();
+        client.approve_loan(&admin, &1);
+
+        // Three partial payments: 1500 + 1500 + 2000 = 5000.
+        env.mock_all_auths();
+        client.repay_loan(&farmer, &1, &1_500);
+        env.mock_all_auths();
+        client.repay_loan(&farmer, &1, &1_500);
+        env.mock_all_auths();
+        client.repay_loan(&farmer, &1, &2_000);
+
+        let loan = client.get_loan(&1);
+        assert!(loan.is_some());
+        let l = loan.unwrap();
+        assert_eq!(l.amount_repaid, 5_000);
+        assert!(matches!(l.status, LoanStatus::Repaid));
+    }
+
     // --- Cross-contract integration tests (issue #9) ---
     // These tests deploy both contracts in the same Soroban test environment
     // and exercise the cross-contract get_score call that microloan makes
