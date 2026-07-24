@@ -292,3 +292,7 @@ Harvestor is built by a community of developers and domain experts committed to 
 ---
 
 Happy coding! We look forward to your contributions.
+
+## New here? Start with the First Contribution Walkthrough
+
+If this is your first PR to Harvestor, the [First Contribution Walkthrough](./docs/FIRST_CONTRIBUTION.md) walks you through a real example task end-to-end: toolchain setup, picking an issue, writing tests, committing, opening the PR, and responding to feedback. It uses [Issue #6](https://github.com/harvestor-protocol/harvestor/issues/6) (score boundary validation tests) as the worked example and is designed to be completed in 60–90 minutes.
