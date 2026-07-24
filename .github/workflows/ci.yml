@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Toolchain is pinned to 1.88.0: soroban-sdk 21's dependency tree
+      # requires rustc >= 1.88 (darling 0.23, serde_with 3.21). See
+      # CONTRIBUTING.md for the full compatibility notes.
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Format check
+        run: cargo fmt --check
+        working-directory: ./score_attestation
+
+      - name: Format check (microloan)
+        run: cargo fmt --check
+        working-directory: ./microloan
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: ./score_attestation
+
+      - name: Clippy (microloan)
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: ./microloan
+
+      - name: Tests
+        run: cargo test --lib
+        working-directory: ./score_attestation
+
+      - name: Tests (microloan)
+        run: cargo test --lib
+        working-directory: ./microloan
+
+      - name: Build contract WASM
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: ./score_attestation
+
+      - name: Build contract WASM (microloan)
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: ./microloan
+
+  backend:
+    # Only runs once backend/ exists (see issue #12 acceptance criteria)
+    if: ${{ hashFiles('backend/package.json') != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install
+        run: npm install
+        working-directory: ./backend
+      - name: Lint
+        run: npm run lint
+        working-directory: ./backend
+      - name: Test
+        run: npm test
+        working-directory: ./backend
+
+  frontend:
+    # Only runs once frontend/ exists (see issue #12 acceptance criteria)
+    if: ${{ hashFiles('frontend/package.json') != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install
+        run: npm install
+        working-directory: ./frontend
+      - name: Lint
+        run: npm run lint
+        working-directory: ./frontend
+      - name: Test
+        run: npm test
+        working-directory: ./frontend
