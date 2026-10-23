@@ -1,299 +1,314 @@
 # First Contribution Walkthrough
 
-Welcome to Harvestor! This guide walks a new contributor through their first pull request end-to-end, using a real example task so you can see exactly what each step looks like. Read it once, then follow along on your machine.
+Welcome to Harvestor! This step-by-step walkthrough guides first-time contributors through the complete contribution lifecycle end-to-end: setting up the development environment, selecting an issue, developing and verifying changes, committing with conventional formatting, opening a pull request, and addressing reviewer feedback.
 
-If you have not yet read the project conventions, start with [CONTRIBUTING.md](../CONTRIBUTING.md) — this guide assumes that one is in hand.
+If you have not yet reviewed the project conventions, please start with [CONTRIBUTING.md](../CONTRIBUTING.md) and the architectural overview in [README.md](../README.md).
 
-> **Estimated total time:** 60–90 minutes for a complete first PR (setup 25 min, coding 20 min, PR polish 15 min, review feedback buffer 30 min).
+> **Estimated Time:** 60–90 minutes (Setup: 25 min, Picking an issue: 5 min, Implementation: 20 min, PR polish: 15 min, Review feedback buffer: 25 min).
 
 ---
 
-## 1. Setup (≈25 min)
+## 1. Local Setup
 
-Get the toolchain and a working build on your machine.
+Get the full toolchain and working dependencies installed on your machine. Harvestor consists of Soroban smart contracts, off-chain indexing services, and TypeScript clients.
 
 ### Prerequisites
 
-Install these once:
+Ensure the following tools are installed:
 
-| Tool           | Version  | Install                                              |
-| -------------- | -------- | ---------------------------------------------------- |
-| Rust           | 1.70+    | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
-| Soroban CLI    | 20.x+    | `cargo install soroban-cli`                          |
-| `wasm32` target| stable   | `rustup target add wasm32-unknown-unknown`           |
-| GitHub CLI     | 2.x+     | <https://cli.github.com/>                            |
+| Tool | Recommended Version | Purpose | Installation |
+|---|---|---|---|
+| **Rust** | `1.70+` | Smart contract compilation | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| **`wasm32` target** | stable | WASM compilation target | `rustup target add wasm32-unknown-unknown` |
+| **Soroban CLI** | `20.x+` / `stellar-cli` | Contract simulation & deployment | `cargo install soroban-cli` |
+| **Node.js** | `18+` or `20+ LTS` | SDK bindings & frontend scripts | [nodejs.org](https://nodejs.org/) or `nvm install 20` |
+| **PostgreSQL** | `14+` | Off-chain attestation indexer store | Local install via package manager or Docker container |
+| **GitHub CLI (`gh`)**| `2.x+` | Forking, branching & PR creation | [cli.github.com](https://cli.github.com/) |
 
-Verify everything is wired up:
+### PostgreSQL Setup
 
+You can run PostgreSQL locally or using Docker:
+
+#### Option A: Docker (Recommended)
 ```bash
-rustc --version        # rustc 1.70.x or newer
-cargo --version
-soroban --version      # 20.x or newer
-rustup target list --installed   # wasm32-unknown-unknown should appear
-gh --version
+docker run --name harvestor-postgres \
+  -e POSTGRES_USER=harvestor \
+  -e POSTGRES_PASSWORD=harvestor \
+  -e POSTGRES_DB=harvestor_dev \
+  -p 5432:5432 -d postgres:15
 ```
 
-### Clone and build
+#### Option B: Local Service
+```bash
+# macOS (Homebrew)
+brew install postgresql@15 && brew services start postgresql@15
+
+# Ubuntu/Debian
+sudo apt-get update && sudo apt-get install -y postgresql postgresql-contrib
+sudo systemctl start postgresql
+```
+
+### Verifying Toolchain Installation
+
+Run the verification commands below to confirm your setup:
+
+```bash
+rustc --version
+# Expected: rustc 1.70.0 (or newer)
+
+cargo --version
+# Expected: cargo 1.70.0 (or newer)
+
+soroban --version
+# Expected: soroban 20.x (or newer)
+
+rustup target list --installed | grep wasm32
+# Expected: wasm32-unknown-unknown
+
+node --version
+# Expected: v18.x.x or v20.x.x
+
+npm --version
+# Expected: 9.x.x or 10.x.x
+
+gh --version
+# Expected: gh version 2.x.x
+```
+
+---
+
+## 2. Running Tests to Verify Setup
+
+Clone your fork of the repository and run the test suites to ensure everything builds cleanly on your system.
+
+### Fork and Clone
 
 ```bash
 gh repo fork harvestor-protocol/harvestor --clone
 cd harvestor
+```
 
-# Build the contracts to confirm toolchain is healthy
+### Build Contracts
+
+Compile both contracts to the `wasm32-unknown-unknown` target:
+
+```bash
+# 1. Build Score Attestation Contract
 cd score_attestation
 cargo build --release --target wasm32-unknown-unknown
-cargo test --lib
-cd ../..
+cd ..
 
+# 2. Build Microloan Contract
 cd microloan
 cargo build --release --target wasm32-unknown-unknown
-cargo test --lib
 cd ..
 ```
 
-If `cargo test --lib` exits 0 in both contracts, you are ready to pick an issue.
-
----
-
-## 2. Pick an issue (≈5 min)
-
-Good first issues are labeled **`good first issue`** in the [issue tracker](https://github.com/harvestor-protocol/harvestor/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
-
-Open an issue and read the **Acceptance Criteria** section carefully. Each box is a concrete deliverable. A good first issue should:
-
-- Have a single file or small surface area.
-- Be reviewable in 30 minutes or less.
-- Tell you exactly what to test, how, and where.
-
-If the issue is unclear, comment asking for clarification rather than guessing. Maintainers prefer a one-line question over a misaligned PR.
-
-### Example: Issue #6 — score boundary validation tests
-
-For this walkthrough we will use [Issue #6](https://github.com/harvestor-protocol/harvestor/issues/6). It is small, self-contained, and exercises the full contribution lifecycle. The acceptance criteria are:
-
-- Add unit tests for `submit_score` covering four boundary values (0, 100, 101, `u32::MAX`).
-- Tests assert that invalid scores panic with `"Score must be between 0 and 100"`.
-- All tests pass under `cargo test --lib`.
-- Tests live in `score_attestation/src/lib.rs`.
-
-That is the entire scope. No contract changes, no docs sprawl, no cross-contract plumbing.
-
----
-
-## 3. Create a branch (≈1 min)
-
-Branch names follow the convention in [CONTRIBUTING.md](../CONTRIBUTING.md#branch-naming): `{type}/{short-description}`.
-
-```bash
-git checkout main
-git pull upstream main        # sync your fork with the project
-git checkout -b test/score-boundary-validation
+Expected output:
+```text
+   Compiling score_attestation v0.1.0 (/path/to/harvestor/score_attestation)
+    Finished `release` profile [optimized] target(s) in 2.45s
 ```
 
-Keep the branch tightly scoped to one issue. If you find an unrelated bug while working, open a separate issue — do not bundle fixes into the same PR.
+### Run Unit Tests
 
----
-
-## 4. Implement (≈15 min)
-
-Open `score_attestation/src/lib.rs` and find the existing test module at the bottom of the file. Skim the surrounding tests so your new tests match the project's style — you will see `setup_contract` reused, `env.mock_all_auths()` set up, and `#[should_panic(expected = "...")]` used for panic assertions.
-
-Drop in four new tests. Note how each maps to an acceptance criterion:
-
-```rust
-#[test]
-fn test_score_boundary_zero_valid() {
-    let env = Env::default();
-    let (contract_id, admin) = setup_contract(&env);
-    let client = ScoreAttestationClient::new(&env, &contract_id);
-    let submitter = Address::generate(&env);
-    let farmer = Address::generate(&env);
-    let evidence_hash = BytesN::<32>::random(&env);
-
-    env.mock_all_auths();
-    client.authorize_submitter(&admin, &submitter);
-    client.submit_score(&submitter, &farmer, &0, &evidence_hash);
-
-    let record = client.get_score(&farmer).unwrap();
-    assert_eq!(record.score, 0);
-}
-
-#[test]
-fn test_score_boundary_one_hundred_valid() {
-    let env = Env::default();
-    let (contract_id, admin) = setup_contract(&env);
-    let client = ScoreAttestationClient::new(&env, &contract_id);
-    let submitter = Address::generate(&env);
-    let farmer = Address::generate(&env);
-    let evidence_hash = BytesN::<32>::random(&env);
-
-    env.mock_all_auths();
-    client.authorize_submitter(&admin, &submitter);
-    client.submit_score(&submitter, &farmer, &100, &evidence_hash);
-
-    let record = client.get_score(&farmer).unwrap();
-    assert_eq!(record.score, 100);
-}
-
-#[test]
-#[should_panic(expected = "Score must be between 0 and 100")]
-fn test_score_boundary_one_hundred_one_panics() {
-    let env = Env::default();
-    let (contract_id, admin) = setup_contract(&env);
-    let client = ScoreAttestationClient::new(&env, &contract_id);
-    let submitter = Address::generate(&env);
-    let farmer = Address::generate(&env);
-    let evidence_hash = BytesN::<32>::random(&env);
-
-    env.mock_all_auths();
-    client.authorize_submitter(&admin, &submitter);
-    client.submit_score(&submitter, &farmer, &101, &evidence_hash);
-}
-
-#[test]
-#[should_panic(expected = "Score must be between 0 and 100")]
-fn test_score_boundary_u32_max_panics() {
-    let env = Env::default();
-    let (contract_id, admin) = setup_contract(&env);
-    let client = ScoreAttestationClient::new(&env, &contract_id);
-    let submitter = Address::generate(&env);
-    let farmer = Address::generate(&env);
-    let evidence_hash = BytesN::<32>::random(&env);
-
-    env.mock_all_auths();
-    client.authorize_submitter(&admin, &submitter);
-    client.submit_score(&submitter, &farmer, &u32::MAX, &evidence_hash);
-}
-```
-
-The two `#[should_panic]` tests cover the validation logic. The two success-path tests pin the lower and upper inclusive bounds.
-
----
-
-## 5. Write tests (already done above)
-
-Soroban contract tests run inside `cargo test --lib`. Each test is a Rust function marked `#[test]`. Reuse the existing `setup_contract` helper at the top of the test module — it returns the registered contract id and the admin address.
-
-Run only the new tests while iterating:
+Execute the unit tests inside each contract crate:
 
 ```bash
-cd score_attestation
-cargo test --lib test_score_boundary
+cd score_attestation && cargo test --lib
+cd ../microloan && cargo test --lib
+cd ..
 ```
 
 Expected output:
-
-```
-running 4 tests
-test test::test_score_boundary_zero_valid ... ok
-test test::test_score_boundary_one_hundred_valid ... ok
-test test::test_score_boundary_one_hundred_one_panics ... ok
-test test::test_score_boundary_u32_max_panics ... ok
-
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```text
+running 12 tests
+test test::test_initialize ... ok
+test test::test_authorize_submitter ... ok
+test test::test_submit_score_valid ... ok
+...
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-Run the full contract suite to confirm nothing regressed:
+---
+
+## 3. Picking a Good First Issue
+
+Before writing code, find an appropriate issue in the [Harvestor Issue Tracker](https://github.com/harvestor-protocol/harvestor/issues).
+
+We maintain designated introductory issues labeled:
+- **`good-first-issue`**: Self-contained tasks with clear boundaries, perfect for first PRs.
+- **`help-wanted`**: Well-scoped improvements open for community contributions.
+
+### Canonical Starting Points: Issues #1 and #2
+
+New contributors are encouraged to start with:
+1. **[Issue #1](https://github.com/harvestor-protocol/harvestor/issues/1) — Score Validation Boundaries**:
+   - Scope: Adding comprehensive boundary checks for attestation scores (validating bounds 0, 100, and out-of-range inputs).
+   - Benefit: Touches only a single contract function and unit test module without touching external dependencies.
+2. **[Issue #2](https://github.com/harvestor-protocol/harvestor/issues/2) — Error Code Documentation**:
+   - Scope: Enhancing doc-comments and documenting error return variants for microloan status transitions.
+   - Benefit: Helps familiarize yourself with Soroban contract types and error models.
+
+### Issue Checklist
+When opening an issue, verify:
+- [ ] You have reviewed the **Acceptance Criteria**.
+- [ ] The issue is currently unassigned. If someone was working on it but has been inactive, comment politely asking if you may take over.
+- [ ] Leave a comment on the issue stating: *"I would like to work on this issue."*
+
+---
+
+## 4. Creating a Branch
+
+Always branch off the latest `main` branch from upstream:
 
 ```bash
-cargo test --lib
+# Ensure local main is up to date with upstream
+git checkout main
+git pull upstream main
+
+# Create a focused feature or fix branch
+git checkout -b fix/issue-name
+```
+
+### Branch Naming Conventions
+Follow the naming scheme defined in [CONTRIBUTING.md#branch-naming](../CONTRIBUTING.md#branch-naming):
+- `feat/feature-name` — for new capabilities or contract features.
+- `fix/issue-name` — for bug fixes and edge-case handling.
+- `docs/doc-update` — for documentation improvements or guides.
+- `test/test-description` — for test additions and harness coverage.
+
+*Example:*
+```bash
+git checkout -b fix/score-boundary-validation
 ```
 
 ---
 
-## 6. Doc comments
+## 5. Making Changes and Testing
 
-The Soroban contract uses `#![no_std]`. Public functions and structs already have doc comments — your tests are private, so they do not need them. The existing convention is to keep test bodies short and self-explanatory, with the test name describing the contract.
+Keep your changes strictly within the scope defined by the issue's Acceptance Criteria.
+
+### Implementation Guidelines
+- Follow `#![no_std]` Soroban guidelines when writing contract code.
+- Avoid introducing unnecessary third-party dependencies.
+- Match existing formatting and idioms in neighboring files.
+
+### Iterative Testing
+Run only the specific tests relevant to your changes during development to iterate quickly:
+
+```bash
+# Run tests matching a specific pattern
+cargo test --lib test_score_boundary
+```
+
+### Code Formatting and Linting
+Before committing, ensure your code conforms to standard Rust formatting:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+```
 
 ---
 
-## 7. Commit and push (≈3 min)
+## 6. Committing with Proper Message Format
 
-Commit messages follow [CONTRIBUTING.md §Git Conventions](../CONTRIBUTING.md#git-conventions): `{type}: {subject}` plus an optional body, ≤72-character subject, blank line, then body.
+Harvestor adheres to the **Conventional Commits** specification. Clear commit messages make changelog generation and code review straightforward.
 
+### Commit Format
+```text
+<type>: <short imperative summary in present tense>
+
+[optional body explaining motivation and context]
+
+Closes #<issue-number>
+```
+
+Allowed types:
+- `feat`: A new feature
+- `fix`: A bug fix
+- `docs`: Documentation only changes
+- `test`: Adding or correcting tests
+- `refactor`: Code change that neither fixes a bug nor adds a feature
+- `chore`: Maintenance tasks, dependency updates
+
+### Example Commit
 ```bash
 git add score_attestation/src/lib.rs
-git commit -m "test: Add score boundary validation tests
+git commit -m "fix: validate score boundaries on submission
 
-Cover the four edge cases required by issue #6:
-score = 0 (minimum valid), score = 100 (maximum valid),
-score = 101 (invalid), score = u32::MAX (overflow).
+Ensure attestation scores outside the [0, 100] range are rejected
+with descriptive error messages.
 
-Tests reuse the existing setup_contract helper and
-match the style of test_submit_score_out_of_range.
-
-Closes #6"
-
-git push origin test/score-boundary-validation
+Closes #1"
 ```
 
 ---
 
-## 8. Open a PR (≈5 min)
+## 7. Pushing and Opening a PR
 
-Open the PR from the GitHub web UI or via the CLI:
+Push your branch to your GitHub fork:
 
+```bash
+git push -u origin fix/issue-name
+```
+
+### Creating the PR via GitHub CLI
 ```bash
 gh pr create \
   --repo harvestor-protocol/harvestor \
   --base main \
-  --head test/score-boundary-validation \
-  --title "test: Add score boundary validation tests" \
-  --body "Closes #6
+  --head <your-github-username>:fix/issue-name \
+  --title "fix: validate score boundaries on submission (#1)" \
+  --body "### Summary
+Resolves #1.
 
-## Summary
-Adds four unit tests covering the boundary cases of \`submit_score\`:
-0 (min), 100 (max), 101 (invalid), u32::MAX (overflow).
+Implements boundary checks for credit score attestations to guarantee
+values remain strictly between 0 and 100 inclusive.
 
-## Testing
+### Changes
+- Added range assertion in \`submit_score\`
+- Added 4 unit tests covering boundary values: 0, 100, 101, and u32::MAX
+
+### Verification
 \`\`\`bash
 cd score_attestation
 cargo test --lib
 \`\`\`
-All 4 new tests pass; full suite remains green."
+All tests pass cleanly."
 ```
 
-A PR description should include:
-
-- **Link to the issue** (`Closes #6`).
-- **Summary** of what changed and why.
-- **Testing** steps — exactly the commands a reviewer should run.
+Alternatively, open the pull request via the GitHub Web UI by navigating to `https://github.com/harvestor-protocol/harvestor`.
 
 ---
 
-## 9. Respond to feedback (≈30 min buffer)
+## 8. Responding to Reviewer Feedback
 
-GitHub automatically updates the PR when you push new commits to the same branch. To address review feedback:
+Code reviews are a collaborative process. If a maintainer requests adjustments:
 
-```bash
-# Edit files based on review
-git add score_attestation/src/lib.rs
-git commit -m "test: Rename boundary_u32_max to boundary_overflow"
-git push origin test/score-boundary-validation
-```
-
-Avoid force-pushes once a review has started — they re-write commit history and make review threads confusing. If a rebase is genuinely needed, coordinate in the PR thread first.
+1. **Make the Requested Changes**: Edit the files locally.
+2. **Verify Locally**: Re-run `cargo test --lib` and `cargo fmt`.
+3. **Commit and Push**:
+   ```bash
+   git add <modified-files>
+   git commit -m "fix: address review feedback on boundary assertions"
+   git push origin fix/issue-name
+   ```
+4. **Notify the Reviewer**: Reply on GitHub to let them know the updates are ready.
+5. Avoid force-pushing (`git push --force`) during active reviews so reviewers can inspect incremental diffs easily.
 
 ---
 
-## What you have learned
+## What You Have Accomplished
 
-You have now completed a Harvestor contribution end-to-end:
+Congratulations! By completing this walkthrough, you have:
+- Established a complete Soroban, Node.js, and PostgreSQL development environment.
+- Verified smart contract compilation and unit testing harnesses.
+- Followed clean git branching and conventional commit workflows.
+- Successfully submitted a compliant pull request.
 
-- Toolchain setup (Rust + Soroban + wasm32).
-- Fork + branch workflow.
-- Reading an acceptance-criteria-driven issue.
-- Writing Soroban contract tests against the `Env` test harness.
-- Running `cargo test --lib` and interpreting results.
-- Conventional commit messages.
-- Opening a PR that links to an issue and lists exact verification commands.
-
-The same shape applies to any issue you pick up next. The acceptance criteria are your scope. The PR description is your proof.
-
-## Where to next
-
-- Browse the [`good first issue`](https://github.com/harvestor-protocol/harvestor/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) label for more small tasks.
-- Read [`ARCHITECTURE.md`](../ARCHITECTURE.md) for the protocol overview.
-- Read [`score_attestation/ARCHITECTURE.md`](../score_attestation/ARCHITECTURE.md) for contract design decisions.
-
-Welcome aboard.
+For further exploration, check out:
+- [CONTRIBUTING.md](../CONTRIBUTING.md) — Comprehensive community contribution rules.
+- [ARCHITECTURE.md](../ARCHITECTURE.md) — Harvestor protocol architecture and contract interactions.
+- [QUICKSTART.md](../QUICKSTART.md) — Quick developer onboarding cheatsheet.
