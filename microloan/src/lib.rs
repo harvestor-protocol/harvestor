@@ -382,10 +382,11 @@ impl MicroLoanContract {
         );
     }
 
-    /// Make a repayment on an active loan.
+    /// Make a repayment on an active or defaulted loan.
     ///
     /// Farmer can repay in full or in part. Once fully repaid, the loan status
-    /// transitions to Repaid. Overpayments are rejected.
+    /// transitions to Repaid. Overpayments are rejected. Farmers can repay even
+    /// after the due date, including after a loan has been marked as defaulted.
     ///
     /// # Arguments
     /// * `farmer` - The farmer's address (must sign the transaction)
@@ -396,7 +397,8 @@ impl MicroLoanContract {
     /// # Panics
     /// * Panics with "Repayment amount must be positive" if `amount` <= 0
     /// * Panics with "Loan not found" if no loan exists with `loan_id`
-    /// * Panics with "Loan is not Active" if the loan is not in Active status
+    /// * Panics with "Loan is not active or defaulted" if the loan is not in
+    ///   Active or Defaulted status
     /// * Panics with "Only the loan farmer can repay this loan" if `farmer`
     ///   is not the loan's borrower
     /// * Panics with "Repayment amount exceeds remaining balance" on
@@ -414,8 +416,8 @@ impl MicroLoanContract {
             .get(&DataKey::Loan(loan_id))
             .unwrap_or_else(|| panic!("Loan not found"));
 
-        if loan.status != LoanStatus::Active {
-            panic!("Loan is not Active");
+        if loan.status != LoanStatus::Active && loan.status != LoanStatus::Defaulted {
+            panic!("Loan is not active or defaulted");
         }
 
         if loan.farmer != farmer {
@@ -993,6 +995,158 @@ mod tests {
         let l = loan.unwrap();
         assert_eq!(l.amount_repaid, 5_000);
         assert!(matches!(l.status, LoanStatus::Repaid));
+    }
+
+    #[test]
+    fn test_repay_defaulted_loan_full_transitions_to_repaid() {
+        let env = Env::default();
+        let (contract_id, admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+
+        let score_id = env.register_contract(None, ScoreAttestation);
+        let score_admin = Address::generate(&env);
+        let score_client = ScoreAttestationClient::new(&env, &score_id);
+        env.mock_all_auths();
+        score_client.initialize(&score_admin);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+        score_client.authorize_submitter(&score_admin, &submitter);
+
+        let score_addr: Address = score_id.clone();
+        env.mock_all_auths();
+        client.set_score_contract(&admin, &score_addr);
+
+        let lender = Address::generate(&env);
+        env.mock_all_auths();
+        client.fund_pool(&lender, &20_000);
+
+        let farmer = Address::generate(&env);
+        let evidence_hash = BytesN::<32>::random(&env);
+        env.mock_all_auths();
+        score_client.submit_score(&submitter, &farmer, &75, &evidence_hash);
+
+        env.mock_all_auths();
+        client.request_loan(&farmer, &5_000, &30);
+        env.mock_all_auths();
+        client.approve_loan(&admin, &1);
+
+        // Advance ledger timestamp past due date
+        env.ledger().set_timestamp(10_000_000);
+
+        // Mark as defaulted by admin
+        env.mock_all_auths();
+        client.mark_defaulted(&admin, &1);
+
+        let loan_before = client.get_loan(&1).unwrap();
+        assert!(matches!(loan_before.status, LoanStatus::Defaulted));
+
+        // Late repayment after default — farmer repays in full
+        env.mock_all_auths();
+        client.repay_loan(&farmer, &1, &5_000);
+
+        let loan_after = client.get_loan(&1).unwrap();
+        assert_eq!(loan_after.amount_repaid, 5_000);
+        assert!(matches!(loan_after.status, LoanStatus::Repaid));
+    }
+
+    #[test]
+    fn test_repay_defaulted_loan_partial_remains_defaulted_until_full() {
+        let env = Env::default();
+        let (contract_id, admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+
+        let score_id = env.register_contract(None, ScoreAttestation);
+        let score_admin = Address::generate(&env);
+        let score_client = ScoreAttestationClient::new(&env, &score_id);
+        env.mock_all_auths();
+        score_client.initialize(&score_admin);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+        score_client.authorize_submitter(&score_admin, &submitter);
+
+        let score_addr: Address = score_id.clone();
+        env.mock_all_auths();
+        client.set_score_contract(&admin, &score_addr);
+
+        let lender = Address::generate(&env);
+        env.mock_all_auths();
+        client.fund_pool(&lender, &20_000);
+
+        let farmer = Address::generate(&env);
+        let evidence_hash = BytesN::<32>::random(&env);
+        env.mock_all_auths();
+        score_client.submit_score(&submitter, &farmer, &75, &evidence_hash);
+
+        env.mock_all_auths();
+        client.request_loan(&farmer, &5_000, &30);
+        env.mock_all_auths();
+        client.approve_loan(&admin, &1);
+
+        // Advance ledger timestamp past due date
+        env.ledger().set_timestamp(10_000_000);
+
+        // Mark as defaulted
+        env.mock_all_auths();
+        client.mark_defaulted(&admin, &1);
+
+        // First partial repayment on defaulted loan: 2000 of 5000
+        env.mock_all_auths();
+        client.repay_loan(&farmer, &1, &2_000);
+
+        let loan_mid = client.get_loan(&1).unwrap();
+        assert_eq!(loan_mid.amount_repaid, 2_000);
+        assert!(matches!(loan_mid.status, LoanStatus::Defaulted));
+
+        // Final repayment to clear remaining balance: 3000
+        env.mock_all_auths();
+        client.repay_loan(&farmer, &1, &3_000);
+
+        let loan_done = client.get_loan(&1).unwrap();
+        assert_eq!(loan_done.amount_repaid, 5_000);
+        assert!(matches!(loan_done.status, LoanStatus::Repaid));
+    }
+
+    #[test]
+    #[should_panic(expected = "Loan is not active or defaulted")]
+    fn test_repay_already_repaid_loan_rejected() {
+        let env = Env::default();
+        let (contract_id, admin) = setup_contract(&env);
+        let client = MicroLoanContractClient::new(&env, &contract_id);
+
+        let score_id = env.register_contract(None, ScoreAttestation);
+        let score_admin = Address::generate(&env);
+        let score_client = ScoreAttestationClient::new(&env, &score_id);
+        env.mock_all_auths();
+        score_client.initialize(&score_admin);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+        score_client.authorize_submitter(&score_admin, &submitter);
+
+        let score_addr: Address = score_id.clone();
+        env.mock_all_auths();
+        client.set_score_contract(&admin, &score_addr);
+
+        let lender = Address::generate(&env);
+        env.mock_all_auths();
+        client.fund_pool(&lender, &20_000);
+
+        let farmer = Address::generate(&env);
+        let evidence_hash = BytesN::<32>::random(&env);
+        env.mock_all_auths();
+        score_client.submit_score(&submitter, &farmer, &75, &evidence_hash);
+
+        env.mock_all_auths();
+        client.request_loan(&farmer, &5_000, &30);
+        env.mock_all_auths();
+        client.approve_loan(&admin, &1);
+
+        // Repay in full
+        env.mock_all_auths();
+        client.repay_loan(&farmer, &1, &5_000);
+
+        // Try repaying again on fully repaid loan — must panic
+        env.mock_all_auths();
+        client.repay_loan(&farmer, &1, &1_000);
     }
 
     // --- Cross-contract integration tests (issue #9) ---
