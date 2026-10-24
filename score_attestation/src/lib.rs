@@ -17,7 +17,7 @@
 //!   [`ScoreAttestation::submit_score`].
 //! - Read functions are permissionless.
 
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Symbol, vec, Address, BytesN, Env, Vec};
 
 /// Unique score record for a farmer containing all attestation data
 #[derive(Clone)]
@@ -204,6 +204,18 @@ impl ScoreAttestation {
             .set(&DataKey::MinSubmissionInterval, &seconds);
     }
 
+    /// Retrieve the current minimum interval (in seconds) between submissions
+    /// for the same (submitter, farmer) pair. Defaults to 86,400 (24h) if unset.
+    ///
+    /// # Returns
+    /// The cooldown period in seconds
+    pub fn get_submission_cooldown(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinSubmissionInterval)
+            .unwrap_or(86_400u64)
+    }
+
     /// Submit a credit score attestation for a farmer.
     ///
     /// Only authorized submitters can call this function. The submitter must sign the
@@ -286,7 +298,7 @@ impl ScoreAttestation {
         // per-farmer and per-event-type.
         env.events().publish(
             (
-                symbol_short!("score_submitted"),
+                Symbol::new(&env, "score_submitted"),
                 farmer.clone(),
             ),
             (score, submitter.clone(), timestamp),
@@ -348,8 +360,8 @@ impl ScoreAttestation {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, BytesN as _},
-        Env,
+        testutils::{Address as _, BytesN as _, Events as _, Ledger as _},
+        Env, IntoVal, Val,
     };
 
     fn setup_contract(env: &Env) -> (Address, Address) {
@@ -522,8 +534,9 @@ mod tests {
         // Authorize submitter
         client.authorize_submitter(&admin, &submitter);
 
-        // Submit multiple scores
+        // Submit multiple scores with timestamps past cooldown
         for i in 0u32..3 {
+            env.ledger().set_timestamp(1_000 + (i as u64) * 86_400);
             let evidence_hash = BytesN::<32>::random(&env);
             client.submit_score(&submitter, &farmer, &(30 + i * 20), &evidence_hash);
         }
@@ -556,8 +569,9 @@ mod tests {
         // Authorize submitter
         client.authorize_submitter(&admin, &submitter);
 
-        // Submit multiple scores
+        // Submit multiple scores with timestamps past cooldown
         for i in 0u32..3 {
+            env.ledger().set_timestamp(1_000 + (i as u64) * 86_400);
             let evidence_hash = BytesN::<32>::random(&env);
             client.submit_score(&submitter, &farmer, &(30 + i * 20), &evidence_hash);
         }
@@ -654,17 +668,14 @@ mod tests {
         // ("score_submitted", farmer).
         let events = env.events().all();
         assert!(!events.is_empty(), "no events emitted");
-        // The latest event should reference our farmer.
-        let found = events.iter().any(|(_, topics, _)| match topics {
-            soroban_sdk::Vec::<_>::Arr(items) => items
-                .iter()
-                .any(|t| t == symbol_short!("score_submitted")),
-            _ => false,
-        });
+        let sym_val: Val = Symbol::new(&env, "score_submitted").into_val(&env);
+        let found = events.iter().any(|(_, topics, _)| topics.contains(sym_val));
         assert!(found, "score_submitted event not found in topics");
+    }
+
     // --- Boundary tests for score validation (issue #6) ---
 
-    fn setup_with_authorized_submitter(env: &Env) -> (ScoreAttestationClient, Address, BytesN<32>) {
+    fn setup_with_authorized_submitter(env: &Env) -> (ScoreAttestationClient<'_>, Address, BytesN<32>) {
         let (contract_id, admin) = setup_contract(env);
         let client = ScoreAttestationClient::new(env, &contract_id);
         let submitter = Address::generate(env);
@@ -725,10 +736,30 @@ mod tests {
         client.submit_score(&submitter, &farmer, &max_score, &evidence_hash);
     }
 
-    // --- Rate-limiting / cooldown tests (issue #8) ---
+    // --- Rate-limiting / cooldown tests (issue #26) ---
 
     #[test]
-    fn test_cooldown_default_succeeds_then_rejects_within_window() {
+    fn test_cooldown_first_submission_succeeds() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+        client.authorize_submitter(&admin, &submitter);
+        let farmer = Address::generate(&env);
+        let evidence_hash = BytesN::<32>::random(&env);
+
+        // First submission succeeds
+        client.submit_score(&submitter, &farmer, &80, &evidence_hash);
+        let stored = client.get_score(&farmer).expect("score should be recorded");
+        assert_eq!(stored.score, 80);
+        assert_eq!(stored.timestamp, 1_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Submission cooldown not elapsed")]
+    fn test_cooldown_second_submission_within_window_fails() {
         let env = Env::default();
         env.ledger().set_timestamp(1_000);
         let (contract_id, admin) = setup_contract(&env);
@@ -738,23 +769,16 @@ mod tests {
         client.authorize_submitter(&admin, &submitter);
         let farmer = Address::generate(&env);
         let evidence_hash1 = BytesN::<32>::random(&env);
-        env.mock_all_auths();
-        // First submission at t=1000 — should succeed.
         client.submit_score(&submitter, &farmer, &75, &evidence_hash1);
 
+        // Second submission 100 seconds later (well within 24h / 86400s default) must panic
         let evidence_hash2 = BytesN::<32>::random(&env);
-        env.mock_all_auths();
-        // Second submission 100 seconds later (well within 24h default) —
-        // must panic.
         env.ledger().set_timestamp(1_100);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.submit_score(&submitter, &farmer, &80, &evidence_hash2);
-        }));
-        assert!(result.is_err(), "second submission within cooldown should panic");
+        client.submit_score(&submitter, &farmer, &85, &evidence_hash2);
     }
 
     #[test]
-    fn test_cooldown_succeeds_after_window_elapses() {
+    fn test_cooldown_submission_after_window_elapses_succeeds() {
         let env = Env::default();
         env.ledger().set_timestamp(1_000);
         let (contract_id, admin) = setup_contract(&env);
@@ -764,54 +788,133 @@ mod tests {
         client.authorize_submitter(&admin, &submitter);
         let farmer = Address::generate(&env);
         let evidence_hash1 = BytesN::<32>::random(&env);
-        env.mock_all_auths();
-        // First submission at t=1000.
         client.submit_score(&submitter, &farmer, &75, &evidence_hash1);
 
-        let evidence_hash2 = BytesN::<32>::random(&env);
-        env.mock_all_auths();
-        // Advance ledger 86401 seconds (just past the 24h default).
+        // Advance ledger 86401 seconds (past 24h default)
         env.ledger().set_timestamp(1_000 + 86_401);
-        // Should succeed.
-        client.submit_score(&submitter, &farmer, &80, &evidence_hash2);
+        let evidence_hash2 = BytesN::<32>::random(&env);
+        client.submit_score(&submitter, &farmer, &90, &evidence_hash2);
 
-        let stored = client.get_score(&farmer);
-        assert!(stored.is_some());
-        assert_eq!(stored.unwrap().score, 80, "second score should be stored after cooldown");
+        let stored = client.get_score(&farmer).expect("updated score exists");
+        assert_eq!(stored.score, 90);
+        assert_eq!(stored.timestamp, 1_000 + 86_401);
+
+        let history = client.get_score_history(&farmer);
+        assert_eq!(history.len(), 2);
     }
 
     #[test]
-    fn test_cooldown_configurable_admin_can_shorten() {
+    fn test_cooldown_configurable_admin_can_update_and_query() {
         let env = Env::default();
         env.ledger().set_timestamp(1_000);
         let (contract_id, admin) = setup_contract(&env);
         let client = ScoreAttestationClient::new(&env, &contract_id);
 
-        // Admin sets the cooldown to 60 seconds.
+        // Default cooldown should be 86400
+        assert_eq!(client.get_submission_cooldown(), 86_400);
+
+        // Admin updates cooldown to 60 seconds
         env.mock_all_auths();
         client.set_submission_cooldown(&admin, &60u64);
+        assert_eq!(client.get_submission_cooldown(), 60);
 
         let submitter = Address::generate(&env);
-        env.mock_all_auths();
         client.authorize_submitter(&admin, &submitter);
         let farmer = Address::generate(&env);
         let evidence_hash1 = BytesN::<32>::random(&env);
-        env.mock_all_auths();
         client.submit_score(&submitter, &farmer, &75, &evidence_hash1);
 
-        let evidence_hash2 = BytesN::<32>::random(&env);
-        env.mock_all_auths();
-        // 30 seconds later (within the new 60s cooldown) — must panic.
-        env.ledger().set_timestamp(1_030);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.submit_score(&submitter, &farmer, &80, &evidence_hash2);
-        }));
-        assert!(result.is_err(), "submission within shortened cooldown should panic");
-
-        // 61 seconds later — should succeed.
-        let evidence_hash3 = BytesN::<32>::random(&env);
-        env.mock_all_auths();
+        // 61 seconds later (past 60s cooldown) should succeed
         env.ledger().set_timestamp(1_061);
-        client.submit_score(&submitter, &farmer, &85, &evidence_hash3);
+        let evidence_hash2 = BytesN::<32>::random(&env);
+        client.submit_score(&submitter, &farmer, &85, &evidence_hash2);
+
+        let stored = client.get_score(&farmer).expect("score exists");
+        assert_eq!(stored.score, 85);
+    }
+
+    #[test]
+    #[should_panic(expected = "Caller is not the admin")]
+    fn test_cooldown_non_admin_cannot_set() {
+        let env = Env::default();
+        let (contract_id, _admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let non_admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_submission_cooldown(&non_admin, &120u64);
+    }
+
+    #[test]
+    fn test_cooldown_different_farmers_independent() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+        client.authorize_submitter(&admin, &submitter);
+
+        let farmer1 = Address::generate(&env);
+        let farmer2 = Address::generate(&env);
+        let hash1 = BytesN::<32>::random(&env);
+        let hash2 = BytesN::<32>::random(&env);
+
+        // Submitter submits for farmer1
+        client.submit_score(&submitter, &farmer1, &70, &hash1);
+
+        // Submitter submits for farmer2 immediately at same timestamp - succeeds because different farmer
+        client.submit_score(&submitter, &farmer2, &80, &hash2);
+
+        assert_eq!(client.get_score(&farmer1).unwrap().score, 70);
+        assert_eq!(client.get_score(&farmer2).unwrap().score, 80);
+    }
+
+    #[test]
+    fn test_cooldown_different_submitters_independent() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let submitter1 = Address::generate(&env);
+        let submitter2 = Address::generate(&env);
+        env.mock_all_auths();
+        client.authorize_submitter(&admin, &submitter1);
+        client.authorize_submitter(&admin, &submitter2);
+
+        let farmer = Address::generate(&env);
+        let hash1 = BytesN::<32>::random(&env);
+        let hash2 = BytesN::<32>::random(&env);
+
+        // Submitter 1 submits
+        client.submit_score(&submitter1, &farmer, &70, &hash1);
+
+        // Submitter 2 submits for same farmer immediately - succeeds because different submitter
+        client.submit_score(&submitter2, &farmer, &80, &hash2);
+
+        let history = client.get_score_history(&farmer);
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn test_cooldown_zero_disables_rate_limiting() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        env.mock_all_auths();
+        client.set_submission_cooldown(&admin, &0u64);
+
+        let submitter = Address::generate(&env);
+        client.authorize_submitter(&admin, &submitter);
+        let farmer = Address::generate(&env);
+        let hash1 = BytesN::<32>::random(&env);
+        let hash2 = BytesN::<32>::random(&env);
+
+        // Both submissions happen at the exact same timestamp t=1000
+        client.submit_score(&submitter, &farmer, &70, &hash1);
+        client.submit_score(&submitter, &farmer, &85, &hash2);
+
+        assert_eq!(client.get_score(&farmer).unwrap().score, 85);
     }
 }

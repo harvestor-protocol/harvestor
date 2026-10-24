@@ -12,8 +12,10 @@ settlement in regions where smallholder farmers operate.
 | `authorize_submitter(admin, org)` | Admin whitelists an org so it can submit scores |
 | `revoke_submitter(admin, org)` | Admin removes an org from the whitelist |
 | `set_submission_cooldown(admin, seconds)` | Admin configures the per-(submitter, farmer) cooldown; default 86400 s (24 h); set 0 to disable |
+| `get_submission_cooldown()` | Query the current submission cooldown interval in seconds |
 | `submit_score(submitter, farmer, score, evidence_hash)` | Authorized org records a score in `[0, 100]`; rejects duplicate submissions within the cooldown window; emits `score_submitted` event |
 | `get_score(farmer)` | Returns the latest `ScoreRecord` for a farmer (or `None`) |
+| `get_score_history(farmer)` | Returns the full list of `ScoreRecord` history for a farmer |
 
 ## Rate-limiting (cooldown)
 
