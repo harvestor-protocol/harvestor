@@ -17,7 +17,7 @@
 //!   [`ScoreAttestation::submit_score`].
 //! - Read functions are permissionless.
 
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Symbol, Vec};
 
 /// Unique score record for a farmer containing all attestation data
 #[derive(Clone)]
@@ -277,18 +277,13 @@ impl ScoreAttestation {
         };
 
         // Record the submission timestamp for future cooldown checks.
-        env.storage()
-            .persistent()
-            .set(&last_key, &timestamp);
+        env.storage().persistent().set(&last_key, &timestamp);
 
         // Emit ScoreSubmitted event — (score, submitter, timestamp).
         // Topics: ("score_submitted", farmer) so indexers can subscribe
         // per-farmer and per-event-type.
         env.events().publish(
-            (
-                symbol_short!("score_submitted"),
-                farmer.clone(),
-            ),
+            (Symbol::new(&env, "score_submitted"), farmer.clone()),
             (score, submitter.clone(), timestamp),
         );
 
@@ -346,10 +341,11 @@ impl ScoreAttestation {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, BytesN as _},
-        Env,
+        testutils::{Address as _, BytesN as _, Events as _, Ledger as _},
+        Env, TryFromVal,
     };
 
     fn setup_contract(env: &Env) -> (Address, Address) {
@@ -524,6 +520,7 @@ mod tests {
 
         // Submit multiple scores
         for i in 0u32..3 {
+            env.ledger().set_timestamp(1_000 + (i as u64) * 86_500);
             let evidence_hash = BytesN::<32>::random(&env);
             client.submit_score(&submitter, &farmer, &(30 + i * 20), &evidence_hash);
         }
@@ -558,6 +555,7 @@ mod tests {
 
         // Submit multiple scores
         for i in 0u32..3 {
+            env.ledger().set_timestamp(1_000 + (i as u64) * 86_500);
             let evidence_hash = BytesN::<32>::random(&env);
             client.submit_score(&submitter, &farmer, &(30 + i * 20), &evidence_hash);
         }
@@ -654,17 +652,19 @@ mod tests {
         // ("score_submitted", farmer).
         let events = env.events().all();
         assert!(!events.is_empty(), "no events emitted");
-        // The latest event should reference our farmer.
-        let found = events.iter().any(|(_, topics, _)| match topics {
-            soroban_sdk::Vec::<_>::Arr(items) => items
+        let score_sym = Symbol::new(&env, "score_submitted");
+        let found = events.iter().any(|(_, topics, _)| {
+            topics
                 .iter()
-                .any(|t| t == symbol_short!("score_submitted")),
-            _ => false,
+                .any(|t| soroban_sdk::Symbol::try_from_val(&env, &t).is_ok_and(|s| s == score_sym))
         });
         assert!(found, "score_submitted event not found in topics");
+    }
     // --- Boundary tests for score validation (issue #6) ---
 
-    fn setup_with_authorized_submitter(env: &Env) -> (ScoreAttestationClient, Address, BytesN<32>) {
+    fn setup_with_authorized_submitter(
+        env: &Env,
+    ) -> (ScoreAttestationClient<'_>, Address, BytesN<32>) {
         let (contract_id, admin) = setup_contract(env);
         let client = ScoreAttestationClient::new(env, &contract_id);
         let submitter = Address::generate(env);
@@ -699,7 +699,11 @@ mod tests {
 
         let stored = client.get_score(&farmer);
         assert!(stored.is_some(), "score=100 should be accepted");
-        assert_eq!(stored.unwrap().score, 100, "score=100 should be stored as 100");
+        assert_eq!(
+            stored.unwrap().score,
+            100,
+            "score=100 should be stored as 100"
+        );
     }
 
     #[test]
@@ -750,7 +754,10 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.submit_score(&submitter, &farmer, &80, &evidence_hash2);
         }));
-        assert!(result.is_err(), "second submission within cooldown should panic");
+        assert!(
+            result.is_err(),
+            "second submission within cooldown should panic"
+        );
     }
 
     #[test]
@@ -777,7 +784,11 @@ mod tests {
 
         let stored = client.get_score(&farmer);
         assert!(stored.is_some());
-        assert_eq!(stored.unwrap().score, 80, "second score should be stored after cooldown");
+        assert_eq!(
+            stored.unwrap().score,
+            80,
+            "second score should be stored after cooldown"
+        );
     }
 
     #[test]
@@ -806,7 +817,10 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.submit_score(&submitter, &farmer, &80, &evidence_hash2);
         }));
-        assert!(result.is_err(), "submission within shortened cooldown should panic");
+        assert!(
+            result.is_err(),
+            "submission within shortened cooldown should panic"
+        );
 
         // 61 seconds later — should succeed.
         let evidence_hash3 = BytesN::<32>::random(&env);

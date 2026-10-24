@@ -14,7 +14,8 @@
 //! See [`LoanStatus`].
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, IntoVal, Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol,
+    Vec,
 };
 
 /// Loan status enumeration: Pending → Active → Repaid or Defaulted
@@ -198,7 +199,7 @@ impl MicroLoanContract {
         // Emit PoolFunded event — (amount, new_pool_balance).
         // Topics: ("pool_funded", lender) so indexers can subscribe per-lender.
         env.events().publish(
-            (symbol_short!("pool_funded"), lender.clone()),
+            (Symbol::new(&env, "pool_funded"), lender.clone()),
             (amount, pool_bal + amount),
         );
     }
@@ -311,7 +312,7 @@ impl MicroLoanContract {
         // Emit LoanRequested event — (loan_id, amount, term_days).
         // Topics: ("loan_requested", farmer) so indexers can subscribe per-farmer.
         env.events().publish(
-            (symbol_short!("loan_requested"), farmer.clone()),
+            (Symbol::new(&env, "loan_requested"), farmer.clone()),
             (loan_id, amount, term_days),
         );
     }
@@ -377,7 +378,7 @@ impl MicroLoanContract {
         // Topics: ("loan_approved", loan_id) so indexers can subscribe per-loan.
         let approved_at = env.ledger().timestamp();
         env.events().publish(
-            (symbol_short!("loan_approved"), loan_id),
+            (Symbol::new(&env, "loan_approved"), loan_id),
             (approver.clone(), approved_at),
         );
     }
@@ -449,7 +450,7 @@ impl MicroLoanContract {
         let new_remaining = loan.amount - loan.amount_repaid;
         let repaid_at = env.ledger().timestamp();
         env.events().publish(
-            (symbol_short!("loan_repaid"), loan_id),
+            (Symbol::new(&env, "loan_repaid"), loan_id),
             (farmer.clone(), amount, new_remaining, repaid_at),
         );
     }
@@ -500,15 +501,13 @@ impl MicroLoanContract {
         }
 
         loan.status = LoanStatus::Defaulted;
-        env.storage()
-            .instance()
-            .set(&DataKey::Loan(loan_id), &loan);
+        env.storage().instance().set(&DataKey::Loan(loan_id), &loan);
 
         // Emit LoanDefaulted event — (farmer, defaulted_at).
         // Topics: ("loan_defaulted", loan_id) so indexers can subscribe per-loan.
         let defaulted_at = env.ledger().timestamp();
         env.events().publish(
-            (symbol_short!("loan_defaulted"), loan_id),
+            (Symbol::new(&env, "loan_defaulted"), loan_id),
             (loan.farmer.clone(), defaulted_at),
         );
     }
@@ -576,7 +575,10 @@ impl MicroLoanContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, BytesN as _, Events as _, Ledger as _},
+        Env,
+    };
 
     fn setup_contract(env: &Env) -> (Address, Address) {
         let admin = Address::generate(env);
@@ -727,42 +729,6 @@ mod tests {
     }
 
     // --- Overpayment / partial / late repayment tests (issue #10) ---
-
-    fn create_active_loan(env: &Env, client: &MicroLoanContractClient, amount: i128) -> u64 {
-        // Fund pool so approve+disburse succeeds.
-        let lender = Address::generate(env);
-        env.mock_all_auths();
-        client.fund_pool(&lender, &(amount * 2));
-
-        let admin = Address::generate(env);
-        // We need the actual admin that initialized the contract; reconstruct.
-        // setup_contract initializes with its own admin, so for these tests we
-        // re-fetch by re-creating the contract.
-        env.mock_all_auths();
-        let _ = admin;
-
-        let farmer = Address::generate(env);
-        env.mock_all_auths();
-        // Advance ledger so due_at is in the past (no auto-default though).
-        env.ledger().set_timestamp(1_000);
-        // Approve a loan directly through internal setup: we don't have a public
-        // create-loan helper, so we rely on the fact that approve_loan creates
-        // the loan and sets it Active. We call request_loan via a contract
-        // that already has a configured score contract... but for this test
-        // we use the fact that approve_loan can be invoked on a Pending loan
-        // that was created elsewhere. Skip — instead, use setup_contract which
-        // gives us a fresh admin we can use to approve.
-        // For this we bypass the request_loan gate and just set up the loan
-        // directly via the storage helper is not exposed... so we use a
-        // minimal alternative: invoke request_loan after standing up the
-        // score contract, then approve. Or skip and assume loan id 1 with
-        // a known amount.
-        // The simplest path: build a fresh microloan + score contract
-        // boundary setup so we can call request_loan + approve.
-        let _ = farmer;
-        let _ = client;
-        amount
-    }
 
     #[test]
     #[should_panic(expected = "Repayment amount exceeds remaining balance")]
@@ -1005,32 +971,36 @@ mod tests {
     fn setup_microloan_with_score(
         env: &Env,
     ) -> (
-        MicroLoanContractClient,
-        ScoreAttestationClient,
+        MicroLoanContractClient<'_>,
+        ScoreAttestationClient<'_>,
         Address,
         Address,
     ) {
         // Deploy score contract
         let score_id = env.register_contract(None, ScoreAttestation);
         let score_client = ScoreAttestationClient::new(env, &score_id);
+        let score_admin = Address::generate(env);
+        env.mock_all_auths();
+        score_client.initialize(&score_admin);
 
         // Deploy microloan contract
-        let admin = Address::generate(env);
+        let loan_admin = Address::generate(env);
         let loan_id_addr = env.register_contract(None, MicroLoanContract);
         let loan_client = MicroLoanContractClient::new(env, &loan_id_addr);
 
         env.mock_all_auths();
-        loan_client.initialize(&admin);
+        loan_client.initialize(&loan_admin);
         // Wire the score contract address
         let score_addr: Address = score_id.clone();
-        loan_client.set_score_contract(&admin, &score_addr);
-        (loan_client, score_client, admin, score_addr)
+        loan_client.set_score_contract(&loan_admin, &score_addr);
+        (loan_client, score_client, loan_admin, score_admin)
     }
 
     #[test]
     fn test_loan_request_valid_score_above_threshold() {
         let env = Env::default();
-        let (loan_client, score_client, _admin, _score_addr) = setup_microloan_with_score(&env);
+        let (loan_client, score_client, _loan_admin, score_admin) =
+            setup_microloan_with_score(&env);
 
         // Lender funds the pool so the loan can be disbursed.
         let lender = Address::generate(&env);
@@ -1040,124 +1010,63 @@ mod tests {
         // Authorize a submitter and submit a passing score for the farmer.
         let submitter = Address::generate(&env);
         env.mock_all_auths();
-        let admin = Address::generate(&env);
-        // The score contract's admin is whoever initializes it; we re-deploy
-        // a fresh score contract here so we control its admin.
-        let fresh_score_id = env.register_contract(None, ScoreAttestation);
-        let fresh_score_client = ScoreAttestationClient::new(&env, &fresh_score_id);
-        let score_admin = Address::generate(&env);
-        env.mock_all_auths();
-        fresh_score_client.initialize(&score_admin);
-        fresh_score_client.authorize_submitter(&score_admin, &submitter);
+        score_client.authorize_submitter(&score_admin, &submitter);
 
         let farmer = Address::generate(&env);
         let evidence_hash = BytesN::<32>::random(&env);
         env.mock_all_auths();
-        fresh_score_client.submit_score(&submitter, &farmer, &75, &evidence_hash);
+        score_client.submit_score(&submitter, &farmer, &75, &evidence_hash);
 
-        // Re-wire microloan to point at the freshly-admined score contract.
-        let fresh_score_addr: Address = fresh_score_id.clone();
-        // Drop the previous test vars; setup_microloan_with_score wired the
-        // first contract. For the second wiring we call set_score_contract
-        // again on the same admin.
-        loan_client.set_score_contract(&score_admin, &fresh_score_addr);
-
-        // Now request the loan — cross-contract call should succeed.
+        // Request loan — cross-contract call should succeed.
         env.mock_all_auths();
         let term_days: u32 = 30;
         loan_client.request_loan(&farmer, &1_000, &term_days);
+
         // Should have created loan id 1 in Pending status.
         let loan = loan_client.get_loan(&1);
         assert!(loan.is_some(), "loan should be created with valid score");
+        assert!(matches!(loan.unwrap().status, LoanStatus::Pending));
     }
 
     #[test]
-    #[should_panic(expected = "Credit score below minimum threshold")]
+    #[should_panic(expected = "Farmer credit score below minimum threshold")]
     fn test_loan_request_rejects_score_below_threshold() {
         let env = Env::default();
-        let (loan_client, _score_client, _admin, score_addr) = setup_microloan_with_score(&env);
-        // After setup_microloan_with_score, score_addr points at a score contract
-        // with no admin authorized — so any submit_score will panic with a
-        // submitter-not-authorized error before our threshold check. The point
-        // of this test is to verify the threshold gate; we use a separate setup
-        // that creates a working score contract below.
-        let _ = score_addr;
+        let (loan_client, score_client, _loan_admin, score_admin) =
+            setup_microloan_with_score(&env);
 
-        let fresh_score_id = env.register_contract(None, ScoreAttestation);
-        let fresh_score_client = ScoreAttestationClient::new(&env, &fresh_score_id);
-        let score_admin = Address::generate(&env);
+        let lender = Address::generate(&env);
         env.mock_all_auths();
-        fresh_score_client.initialize(&score_admin);
+        loan_client.fund_pool(&lender, &10_000);
 
         let submitter = Address::generate(&env);
         env.mock_all_auths();
-        fresh_score_client.authorize_submitter(&score_admin, &submitter);
+        score_client.authorize_submitter(&score_admin, &submitter);
 
         let farmer = Address::generate(&env);
         let evidence_hash = BytesN::<32>::random(&env);
         env.mock_all_auths();
         // Score = 29 is below the minimum threshold (30).
-        fresh_score_client.submit_score(&submitter, &farmer, &29, &evidence_hash);
-
-        // Re-wire microloan to this score contract, then request the loan.
-        let fresh_score_addr: Address = fresh_score_id.clone();
-        // Use the loan_client from setup_microloan_with_score — it shares
-        // storage with the same env, so we can swap the score contract addr.
-        // For simplicity in this test, build a fresh microloan pointed at
-        // the fresh score contract.
-        let loan_admin = Address::generate(&env);
-        let loan_id_addr = env.register_contract(None, MicroLoanContract);
-        let loan2 = MicroLoanContractClient::new(&env, &loan_id_addr);
-        env.mock_all_auths();
-        loan2.initialize(&loan_admin);
-        loan2.set_score_contract(&loan_admin, &fresh_score_addr);
-
-        // Fund the pool so disbursement doesn't fail for a different reason.
-        let lender = Address::generate(&env);
-        env.mock_all_auths();
-        loan2.fund_pool(&lender, &10_000);
+        score_client.submit_score(&submitter, &farmer, &29, &evidence_hash);
 
         env.mock_all_auths();
-        loan2.request_loan(&farmer, &1_000, &30);
+        loan_client.request_loan(&farmer, &1_000, &30);
     }
 
     #[test]
-    #[should_panic(expected = "No score record")]
+    #[should_panic(expected = "Farmer has no credit score on record")]
     fn test_loan_request_rejects_farmer_with_no_score() {
         let env = Env::default();
-        let (loan_client, score_client, admin, score_addr) = setup_microloan_with_score(&env);
-        let _ = score_client;
-
-        // Authorize a submitter on the existing score contract so the
-        // submitter-not-authorized check doesn't trip first.
-        let submitter = Address::generate(&env);
-        env.mock_all_auths();
-        // The score contract was deployed by setup_microloan_with_score but
-        // never initialized; we don't have the admin. Skip init and just
-        // assume the farmer-with-no-score path is exercised here. The score
-        // contract returns None for a farmer with no record, which should
-        // propagate as a "No score record" panic in the microloan.
-
-        // Re-wire a fresh microloan so we control the admin path.
-        let loan_admin = Address::generate(&env);
-        let loan_id_addr = env.register_contract(None, MicroLoanContract);
-        let loan2 = MicroLoanContractClient::new(&env, &loan_id_addr);
-        env.mock_all_auths();
-        loan2.initialize(&loan_admin);
-        // Use the original score_addr (uninitialized) — get_score will return None.
-        loan2.set_score_contract(&loan_admin, &score_addr);
+        let (loan_client, _score_client, _loan_admin, _score_admin) =
+            setup_microloan_with_score(&env);
 
         let lender = Address::generate(&env);
         env.mock_all_auths();
-        loan2.fund_pool(&lender, &10_000);
+        loan_client.fund_pool(&lender, &10_000);
 
         let farmer = Address::generate(&env);
         env.mock_all_auths();
-        loan2.request_loan(&farmer, &1_000, &30);
-
-        // Suppress unused vars warning for `loan_client` and `admin`.
-        let _ = loan_client;
-        let _ = admin;
+        loan_client.request_loan(&farmer, &1_000, &30);
     }
 
     #[test]
@@ -1183,7 +1092,14 @@ mod tests {
 
     // --- Event emission tests (issue #11) ---
 
-    fn find_event_by_topic(events: &soroban_sdk::Vec<(soroban_sdk::Address, soroban_sdk::Val, soroban_sdk::Val)>, topic_name: soroban_sdk::Symbol) -> bool {
+    fn find_event_by_topic(
+        events: &soroban_sdk::Vec<(
+            soroban_sdk::Address,
+            soroban_sdk::Vec<soroban_sdk::Val>,
+            soroban_sdk::Val,
+        )>,
+        topic_name: soroban_sdk::Symbol,
+    ) -> bool {
         // Events in Soroban are stored as (contract, topics_vec, data).
         // We iterate and check if any event has topics_vec containing topic_name.
         // The simplest assertion is: events vector is non-empty after the call.
@@ -1205,7 +1121,7 @@ mod tests {
         client.fund_pool(&lender, &10_000);
         let events = env.events().all();
         assert!(!events.is_empty(), "no events emitted on fund_pool");
-        let found = find_event_by_topic(&events, symbol_short!("pool_funded"));
+        let found = find_event_by_topic(&events, Symbol::new(&env, "pool_funded"));
         // Note: find_event_by_topic is a placeholder; the assertion that
         // events is non-empty is the primary signal here. Real matching
         // requires SDK-specific pattern; CI can refine.
@@ -1215,15 +1131,12 @@ mod tests {
     #[test]
     fn test_loan_requested_event_emitted() {
         let env = Env::default();
-        let (contract_id, _admin) = setup_contract(&env);
+        let (contract_id, loan_admin) = setup_contract(&env);
         let client = MicroLoanContractClient::new(&env, &contract_id);
         let lender = Address::generate(&env);
         env.mock_all_auths();
         client.fund_pool(&lender, &10_000);
-        // request_loan requires score contract; without one it panics with
-        // "Score contract not configured" — but the events vector should be
-        // empty in that case (we panicked before publishing). Switch to a
-        // simpler setup: configure score, request, observe events.
+
         let score_id = env.register_contract(None, ScoreAttestation);
         let score_admin = Address::generate(&env);
         let score_client = ScoreAttestationClient::new(&env, &score_id);
@@ -1235,7 +1148,7 @@ mod tests {
 
         let score_addr: Address = score_id.clone();
         env.mock_all_auths();
-        client.set_score_contract(&score_admin, &score_addr);
+        client.set_score_contract(&loan_admin, &score_addr);
 
         let farmer = Address::generate(&env);
         let evidence_hash = BytesN::<32>::random(&env);
