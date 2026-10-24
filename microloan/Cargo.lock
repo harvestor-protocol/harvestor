@@ -707,6 +707,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "microloan"
 version = "0.1.0"
 dependencies = [
+ "score_attestation",
  "soroban-sdk",
 ]
 
@@ -968,6 +969,13 @@ dependencies = [
  "ref-cast",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "score_attestation"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]

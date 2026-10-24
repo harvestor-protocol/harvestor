@@ -17,7 +17,7 @@
 //!   [`ScoreAttestation::submit_score`].
 //! - Read functions are permissionless.
 
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Symbol, vec, Address, BytesN, Env, Vec};
 
 /// Unique score record for a farmer containing all attestation data
 #[derive(Clone)]
@@ -33,6 +33,30 @@ pub struct ScoreRecord {
     pub submitter: Address,
     /// UNIX timestamp when this score was recorded (seconds since epoch)
     pub timestamp: u64,
+}
+
+/// Event emitted when an attestation is submitted for a farmer.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct ScoreSubmittedEvent {
+    pub farmer: Address,
+    pub submitter: Address,
+    pub score: u32,
+    pub timestamp: u64,
+}
+
+/// Event emitted when an organization is authorized as a score submitter.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SubmitterAuthorizedEvent {
+    pub submitter: Address,
+}
+
+/// Event emitted when an organization's submitter authorization is revoked.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SubmitterRevokedEvent {
+    pub submitter: Address,
 }
 
 /// Storage keys for the contract
@@ -128,10 +152,18 @@ impl ScoreAttestation {
         }
 
         // Add org to authorized submitters
-        submitters.push_back(org);
+        submitters.push_back(org.clone());
         env.storage()
             .persistent()
             .set(&DataKey::Submitters, &submitters);
+
+        // Emit SubmitterAuthorized event
+        env.events().publish(
+            (Symbol::new(&env, "submitter_authorized"), org.clone()),
+            SubmitterAuthorizedEvent {
+                submitter: org,
+            },
+        );
     }
 
     /// Revoke an organization's authorization as a score submitter.
@@ -180,6 +212,14 @@ impl ScoreAttestation {
         env.storage()
             .persistent()
             .set(&DataKey::Submitters, &updated);
+
+        // Emit SubmitterRevoked event
+        env.events().publish(
+            (Symbol::new(&env, "submitter_revoked"), org.clone()),
+            SubmitterRevokedEvent {
+                submitter: org,
+            },
+        );
     }
 
     /// Set the minimum interval (in seconds) between submissions for the
@@ -281,15 +321,20 @@ impl ScoreAttestation {
             .persistent()
             .set(&last_key, &timestamp);
 
-        // Emit ScoreSubmitted event — (score, submitter, timestamp).
+        // Emit ScoreSubmitted event
         // Topics: ("score_submitted", farmer) so indexers can subscribe
         // per-farmer and per-event-type.
         env.events().publish(
             (
-                symbol_short!("score_submitted"),
+                Symbol::new(&env, "score_submitted"),
                 farmer.clone(),
             ),
-            (score, submitter.clone(), timestamp),
+            ScoreSubmittedEvent {
+                farmer: farmer.clone(),
+                submitter: submitter.clone(),
+                score,
+                timestamp,
+            },
         );
 
         // Store as latest score (keyed per-farmer)
@@ -348,8 +393,8 @@ impl ScoreAttestation {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, BytesN as _},
-        Env,
+        testutils::{Address as _, BytesN as _, Events as _, Ledger as _},
+        Env, IntoVal, Val,
     };
 
     fn setup_contract(env: &Env) -> (Address, Address) {
@@ -522,8 +567,9 @@ mod tests {
         // Authorize submitter
         client.authorize_submitter(&admin, &submitter);
 
-        // Submit multiple scores
+        // Submit multiple scores with timestamps past cooldown
         for i in 0u32..3 {
+            env.ledger().set_timestamp(1_000 + (i as u64) * 86_400);
             let evidence_hash = BytesN::<32>::random(&env);
             client.submit_score(&submitter, &farmer, &(30 + i * 20), &evidence_hash);
         }
@@ -556,8 +602,9 @@ mod tests {
         // Authorize submitter
         client.authorize_submitter(&admin, &submitter);
 
-        // Submit multiple scores
+        // Submit multiple scores with timestamps past cooldown
         for i in 0u32..3 {
+            env.ledger().set_timestamp(1_000 + (i as u64) * 86_400);
             let evidence_hash = BytesN::<32>::random(&env);
             client.submit_score(&submitter, &farmer, &(30 + i * 20), &evidence_hash);
         }
@@ -654,17 +701,35 @@ mod tests {
         // ("score_submitted", farmer).
         let events = env.events().all();
         assert!(!events.is_empty(), "no events emitted");
-        // The latest event should reference our farmer.
-        let found = events.iter().any(|(_, topics, _)| match topics {
-            soroban_sdk::Vec::<_>::Arr(items) => items
-                .iter()
-                .any(|t| t == symbol_short!("score_submitted")),
-            _ => false,
-        });
+        let sym_val: Val = Symbol::new(&env, "score_submitted").into_val(&env);
+        let found = events.iter().any(|(_, topics, _)| topics.contains(sym_val));
         assert!(found, "score_submitted event not found in topics");
+    }
+
+    #[test]
+    fn test_submitter_authorized_and_revoked_events_emitted() {
+        let env = Env::default();
+        let (contract_id, admin) = setup_contract(&env);
+        let client = ScoreAttestationClient::new(&env, &contract_id);
+        let org = Address::generate(&env);
+        env.mock_all_auths();
+
+        client.authorize_submitter(&admin, &org);
+        let events = env.events().all();
+        let auth_sym: Val = Symbol::new(&env, "submitter_authorized").into_val(&env);
+        let found_auth = events.iter().any(|(_, topics, _)| topics.contains(auth_sym));
+        assert!(found_auth, "submitter_authorized event not found");
+
+        client.revoke_submitter(&admin, &org);
+        let events_after_rev = env.events().all();
+        let rev_sym: Val = Symbol::new(&env, "submitter_revoked").into_val(&env);
+        let found_rev = events_after_rev.iter().any(|(_, topics, _)| topics.contains(rev_sym));
+        assert!(found_rev, "submitter_revoked event not found");
+    }
+
     // --- Boundary tests for score validation (issue #6) ---
 
-    fn setup_with_authorized_submitter(env: &Env) -> (ScoreAttestationClient, Address, BytesN<32>) {
+    fn setup_with_authorized_submitter(env: &Env) -> (ScoreAttestationClient<'_>, Address, BytesN<32>) {
         let (contract_id, admin) = setup_contract(env);
         let client = ScoreAttestationClient::new(env, &contract_id);
         let submitter = Address::generate(env);
@@ -744,13 +809,9 @@ mod tests {
 
         let evidence_hash2 = BytesN::<32>::random(&env);
         env.mock_all_auths();
-        // Second submission 100 seconds later (well within 24h default) —
-        // must panic.
+        // Second submission 100 seconds later (well within 24h default)
         env.ledger().set_timestamp(1_100);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.submit_score(&submitter, &farmer, &80, &evidence_hash2);
-        }));
-        assert!(result.is_err(), "second submission within cooldown should panic");
+        assert!(client.try_submit_score(&submitter, &farmer, &80, &evidence_hash2).is_err());
     }
 
     #[test]
@@ -801,12 +862,9 @@ mod tests {
 
         let evidence_hash2 = BytesN::<32>::random(&env);
         env.mock_all_auths();
-        // 30 seconds later (within the new 60s cooldown) — must panic.
+        // 30 seconds later (within the new 60s cooldown)
         env.ledger().set_timestamp(1_030);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.submit_score(&submitter, &farmer, &80, &evidence_hash2);
-        }));
-        assert!(result.is_err(), "submission within shortened cooldown should panic");
+        assert!(client.try_submit_score(&submitter, &farmer, &80, &evidence_hash2).is_err());
 
         // 61 seconds later — should succeed.
         let evidence_hash3 = BytesN::<32>::random(&env);
